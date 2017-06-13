@@ -3447,17 +3447,17 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
             {
             if (cstate->ignore_errors)
             {
-        		ErrorData  *edata;
+                ErrorData  *edata;
 
-        		/* Save error info */
+                /* Save error info */
                 MemoryContextSwitchTo(oldcontext);
-        		edata = CopyErrorData();
+                edata = CopyErrorData();
                 FlushErrorState();
                 
                 /* TODO Find an appropriate errcode */
-				ereport(WARNING,
-						(errcode(ERRCODE_TOO_MANY_COLUMNS),
-                        errmsg("%s at line %d col %d", edata->message, cstate->cur_lineno, attnum)));
+                ereport(WARNING,
+                        (errcode(ERRCODE_TOO_MANY_COLUMNS),
+                         errmsg("%s at line %d col %d", edata->message, cstate->cur_lineno, attnum)));
                 return NCF_SKIP;
             }
             else
