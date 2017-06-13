@@ -3244,6 +3244,7 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 
     int         error_level = ERROR;        /* Error level for COPY FROM input data errors */
     int         exec_state = NCF_SUCCESS;   /* Return code */
+    MemoryContext oldcontext = CurrentMemoryContext;
 
 	tupDesc = RelationGetDescr(cstate->rel);
 	attr = tupDesc->attrs;
@@ -3374,10 +3375,38 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 
 			cstate->cur_attname = NameStr(attr[m]->attname);
 			cstate->cur_attval = string;
+
+            PG_TRY();
+            {
 			values[m] = InputFunctionCall(&in_functions[m],
 										  string,
 										  typioparams[m],
 										  attr[m]->atttypmod);
+            }
+            PG_CATCH();
+            {
+            if (cstate->ignore_errors)
+            {
+        		ErrorData  *edata;
+
+        		/* Save error info */
+                MemoryContextSwitchTo(oldcontext);
+        		edata = CopyErrorData();
+                FlushErrorState();
+                
+                /* TODO Find an appropriate errcode */
+				ereport(WARNING,
+						(errcode(ERRCODE_TOO_MANY_COLUMNS),
+                        errmsg("%s at line %d col %d", edata->message, cstate->cur_lineno, attnum)));
+                return NCF_SKIP;
+            }
+            else
+            {
+                PG_RE_THROW();
+            }
+            }
+            PG_END_TRY();
+
 			if (string != NULL)
 				nulls[m] = false;
 			cstate->cur_attname = NULL;
