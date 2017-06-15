@@ -3243,7 +3243,7 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 	ExprState **defexprs = cstate->defexprs;
 
     int         error_level = ERROR;        /* Error level for COPY FROM input data errors */
-    int         exec_state = NCF_SUCCESS;   /* Return code */
+    // int         exec_state = NCF_SUCCESS;   /* Return code */
     MemoryContext oldcontext = CurrentMemoryContext;
 
 	tupDesc = RelationGetDescr(cstate->rel);
@@ -3277,10 +3277,10 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 		/* check for overflowing fields */
 		if (nfields > 0 && fldct > nfields)
         {
-            exec_state = NCF_SKIP;
 			ereport(error_level,
 					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 					 errmsg("extra data after last expected column at line %d", cstate->cur_lineno)));
+            return NCF_SKIP;
         }
 
 
@@ -3291,20 +3291,20 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 		{
 			if (fieldno >= fldct)
             {
-                exec_state = NCF_SKIP;
 				ereport(error_level,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 						 errmsg("missing data for OID column at line %d", cstate->cur_lineno)));
+                return NCF_SKIP;
             }
 
 			string = field_strings[fieldno++];
 
 			if (string == NULL)
             {
-                exec_state = NCF_SKIP;
 				ereport(error_level,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 						 errmsg("null OID in COPY data at line %d", cstate->cur_lineno)));
+                return NCF_SKIP;
             }
 			else if (cstate->oids && tupleOid != NULL)
 			{
@@ -3314,10 +3314,10 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 												   CStringGetDatum(string)));
 				if (*tupleOid == InvalidOid)
                 {
-                    exec_state = NCF_SKIP;
 					ereport(error_level,
 							(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 							 errmsg("invalid OID in COPY data at line %d", cstate->cur_lineno)));
+                    return NCF_SKIP;
                 }
 
 				cstate->cur_attname = NULL;
@@ -3333,11 +3333,11 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 
 			if (fieldno >= fldct)
             {
-                exec_state = NCF_SKIP;
 				ereport(error_level,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 						 errmsg("missing data for column \"%s\" at line %d",
 								NameStr(attr[m]->attname), cstate->cur_lineno)));
+                return NCF_SKIP;
             }
 
 			string = field_strings[fieldno++];
@@ -3426,7 +3426,7 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 		if (!CopyGetInt16(cstate, &fld_count))
 		{
 			/* EOF detected (end of file, or protocol-level EOF) */
-			return false;
+			return NCF_STOP;
 		}
 
 		if (fld_count == -1)
@@ -3455,11 +3455,11 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 
 		if (fld_count != attr_count)
         {
-            exec_state = NCF_SKIP;
 			ereport(error_level,
 					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 					 errmsg("row field count is %d, expected %d",
 							(int) fld_count, attr_count)));
+            return NCF_SKIP;
         }
 
 		if (file_has_oids)
@@ -3476,10 +3476,10 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 														 &isnull));
 			if (isnull || loaded_oid == InvalidOid)
             {
-                exec_state = NCF_SKIP;
 				ereport(error_level,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 						 errmsg("invalid OID in COPY data")));
+                return NCF_SKIP;
             }
 			cstate->cur_attname = NULL;
 			if (cstate->oids && tupleOid != NULL)
@@ -3522,7 +3522,7 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 										 &nulls[defmap[i]]);
 	}
 
-	return exec_state;
+	return NCF_SUCCESS;
 }
 
 /*
