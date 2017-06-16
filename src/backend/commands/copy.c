@@ -3242,8 +3242,8 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 	int		   *defmap = cstate->defmap;
 	ExprState **defexprs = cstate->defexprs;
 
-    int         error_level = ERROR;        /* Error level for COPY FROM input data errors */
-    // int         exec_state = NCF_SUCCESS;   /* Return code */
+    /* Error level for COPY FROM input data errors */
+    int         error_level = ERROR;
     MemoryContext oldcontext = CurrentMemoryContext;
 
 	tupDesc = RelationGetDescr(cstate->rel);
@@ -3376,6 +3376,10 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 			cstate->cur_attname = NameStr(attr[m]->attname);
 			cstate->cur_attval = string;
 
+            /*
+             * Catch errors inside InputFunctionCall to handle
+             * errors due to the type invalid syntax.
+             */
             PG_TRY();
             {
 			values[m] = InputFunctionCall(&in_functions[m],
@@ -3393,15 +3397,16 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
                 MemoryContextSwitchTo(oldcontext);
                 edata = CopyErrorData();
                 FlushErrorState();
-                
-                /* TODO Find an appropriate errcode */
+
+                /* Propagate catched ERROR sqlerrcode and message as WARNING */
                 ereport(WARNING,
-                        (errcode(ERRCODE_TOO_MANY_COLUMNS),
+                        (errcode(edata->sqlerrcode),
                          errmsg("%s at line %d col %d", edata->message, cstate->cur_lineno, attnum)));
                 return NCF_SKIP;
             }
             else
             {
+                /* Propagate ERROR as is if errors handling is not turned on */
                 PG_RE_THROW();
             }
             }
