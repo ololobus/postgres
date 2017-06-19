@@ -44,6 +44,7 @@ COPY { <replaceable class="parameter">table_name</replaceable> [ ( <replaceable 
     FORCE_NOT_NULL ( <replaceable class="parameter">column_name</replaceable> [, ...] )
     FORCE_NULL ( <replaceable class="parameter">column_name</replaceable> [, ...] )
     ENCODING '<replaceable class="parameter">encoding_name</replaceable>'
+    IGNORE_ERRORS [ <replaceable class="parameter">boolean</replaceable> ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -244,6 +245,17 @@ COPY { <replaceable class="parameter">table_name</replaceable> [ ( <replaceable 
       a comma in <literal>CSV</> format.
       This must be a single one-byte character.
       This option is not allowed when using <literal>binary</> format.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>IGNORE_ERRORS</literal></term>
+    <listitem>
+     <para>
+      Specifies ignoring errors in the input data. If TRUE, then all
+      errors due to the extra or missing columns and inappropriate type
+      format will be ignored with WARNING.
      </para>
     </listitem>
    </varlistentry>

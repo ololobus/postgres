@@ -636,7 +636,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	IDENTITY_P IF_P ILIKE IMMEDIATE IMMUTABLE IMPLICIT_P IMPORT_P IN_P
 	INCLUDING INCREMENT INDEX INDEXES INHERIT INHERITS INITIALLY INLINE_P
 	INNER_P INOUT INPUT_P INSENSITIVE INSERT INSTEAD INT_P INTEGER
-	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
+	INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION IGNORE_ERRORS
 
 	JOIN
 
@@ -2976,6 +2976,10 @@ copy_opt_item:
 			| ENCODING Sconst
 				{
 					$$ = makeDefElem("encoding", (Node *)makeString($2), @1);
+				}
+			| IGNORE_ERRORS
+				{
+					$$ = makeDefElem("ignore_errors", (Node *)makeInteger(TRUE), @1);
 				}
 		;
 
