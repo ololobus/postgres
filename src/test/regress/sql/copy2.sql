@@ -72,6 +72,29 @@ COPY x from stdin;
 2002	232	40	50	60	70	80
 \.
 
+-- missing data: should be able to ignore errors
+COPY x from stdin with (ignore_errors);
+2003	230	23	23
+2004	27	37	47	57
+\.
+COPY x from stdin with (ignore_errors);
+2005	231	\N	\N
+2006	28	38	48	58
+\.
+
+-- extra data: should be able to ignore errors
+COPY x from stdin with (ignore_errors);
+2007	232	40	50	60	70	80
+2008	29	39	49	59
+\.
+
+-- data type inappropriate format: should be able to ignore errors
+
+COPY x from stdin with (ignore_errors);
+2009	30	40	50	60
+2010	'24'	34	44	54
+\.
+
 -- various COPY options: delimiters, oids, NULL string, encoding
 COPY x (b, c, d, e) from stdin with oids delimiter ',' null 'x';
 500000,x,45,80,90
