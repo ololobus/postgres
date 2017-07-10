@@ -37,6 +37,7 @@ extern bool NextCopyFromRawFields(CopyState cstate,
 					  char ***fields, int *nfields);
 extern void CopyFromErrorCallback(void *arg);
 
+extern void CopyFromBgwMainLoop(Datum main_arg);
 extern uint64 CopyFrom(CopyState cstate);
 
 extern DestReceiver *CreateCopyDestReceiver(void);
