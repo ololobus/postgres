@@ -36,15 +36,26 @@ COPY x from stdin;
 ERROR:  invalid input syntax for integer: ""
 CONTEXT:  COPY x, line 1, column a: ""
 COPY x from stdin;
-ERROR:  missing data for column "e"
+ERROR:  missing data for column "e" at line 1
 CONTEXT:  COPY x, line 1: "2000	230	23	23"
 COPY x from stdin;
-ERROR:  missing data for column "e"
+ERROR:  missing data for column "e" at line 1
 CONTEXT:  COPY x, line 1: "2001	231	\N	\N"
 -- extra data: should fail
 COPY x from stdin;
-ERROR:  extra data after last expected column
+ERROR:  extra data after last expected column at line 1
 CONTEXT:  COPY x, line 1: "2002	232	40	50	60	70	80"
+-- missing data: should be able to ignore errors
+COPY x from stdin with (ignore_errors);
+WARNING:  missing data for column "e" at line 1
+COPY x from stdin with (ignore_errors);
+WARNING:  missing data for column "e" at line 1
+-- extra data: should be able to ignore errors
+COPY x from stdin with (ignore_errors);
+WARNING:  extra data after last expected column at line 1
+-- data type inappropriate format: should be able to ignore errors
+COPY x from stdin with (ignore_errors);
+WARNING:  invalid input syntax for integer: "'24'" at line 2 col 2
 -- various COPY options: delimiters, oids, NULL string, encoding
 COPY x (b, c, d, e) from stdin with oids delimiter ',' null 'x';
 COPY x from stdin WITH DELIMITER AS ';' NULL AS '';
@@ -60,6 +71,10 @@ SELECT * FROM x;
  10003 | 24 | 34         | 44     | before trigger fired
  10004 | 25 | 35         | 45     | before trigger fired
  10005 | 26 | 36         | 46     | before trigger fired
+  2004 | 27 | 37         | 47     | before trigger fired
+  2006 | 28 | 38         | 48     | before trigger fired
+  2008 | 29 | 39         | 49     | before trigger fired
+  2009 | 30 | 40         | 50     | before trigger fired
      6 |    | 45         | 80     | before trigger fired
      7 |    | x          | \x     | before trigger fired
      8 |    | ,          | \,     | before trigger fired
@@ -78,7 +93,7 @@ SELECT * FROM x;
      3 |  3 | stuff      | test_3 | after trigger fired
      4 |  4 | stuff      | test_4 | after trigger fired
      5 |  5 | stuff      | test_5 | after trigger fired
-(25 rows)
+(29 rows)
 
 -- COPY w/ oids on a table w/o oids should fail
 CREATE TABLE no_oids (
@@ -101,6 +116,10 @@ COPY x TO stdout;
 10003	24	34	44	before trigger fired
 10004	25	35	45	before trigger fired
 10005	26	36	46	before trigger fired
+2004	27	37	47	before trigger fired
+2006	28	38	48	before trigger fired
+2008	29	39	49	before trigger fired
+2009	30	40	50	before trigger fired
 6	\N	45	80	before trigger fired
 7	\N	x	\\x	before trigger fired
 8	\N	,	\\,	before trigger fired
@@ -127,6 +146,10 @@ COPY x (c, e) TO stdout;
 34	before trigger fired
 35	before trigger fired
 36	before trigger fired
+37	before trigger fired
+38	before trigger fired
+39	before trigger fired
+40	before trigger fired
 45	before trigger fired
 x	before trigger fired
 ,	before trigger fired
@@ -153,6 +176,10 @@ I'm null	before trigger fired
 24	before trigger fired
 25	before trigger fired
 26	before trigger fired
+27	before trigger fired
+28	before trigger fired
+29	before trigger fired
+30	before trigger fired
 I'm null	before trigger fired
 I'm null	before trigger fired
 I'm null	before trigger fired

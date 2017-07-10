@@ -54,6 +54,16 @@
 #define OCTVALUE(c) ((c) - '0')
 
 /*
+    NextCopyFrom states:
+    0 – Error or stop
+    1 – Successfully read data
+    2 – Data with errors, skip
+*/
+#define NCF_STOP         0
+#define NCF_SUCCESS      1
+#define NCF_SKIP         2
+
+/*
  * Represents the different source/dest cases we need to worry about at
  * the bottom level
  */
@@ -139,6 +149,7 @@ typedef struct CopyStateData
 	int			cur_lineno;		/* line number for error messages */
 	const char *cur_attname;	/* current att for error messages */
 	const char *cur_attval;		/* current att value for error messages */
+    bool        ignore_errors;  /* ignore errors during COPY FROM */
 
 	/*
 	 * Working state for COPY TO/FROM
@@ -1202,6 +1213,15 @@ ProcessCopyOptions(ParseState *pstate,
 						 errmsg("argument to option \"%s\" must be a valid encoding name",
 								defel->defname),
 						 parser_errposition(pstate, defel->location)));
+		}
+		else if (strcmp(defel->defname, "ignore_errors") == 0)
+		{
+			if (cstate->ignore_errors)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options"),
+						 parser_errposition(pstate, defel->location)));
+			cstate->ignore_errors = defGetBoolean(defel);
 		}
 		else
 			ereport(ERROR,
@@ -2340,6 +2360,7 @@ CopyFrom(CopyState cstate)
 	bool		useHeapMultiInsert;
 	int			nBufferedTuples = 0;
 	int			prev_leaf_part_index = -1;
+    int         next_cf_state; /* NextCopyFrom return state */
 
 #define MAX_BUFFERED_TUPLES 1000
 	HeapTuple  *bufferedTuples = NULL;	/* initialize to silence warning */
@@ -2549,145 +2570,154 @@ CopyFrom(CopyState cstate)
 		/* Switch into its memory context */
 		MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
-		if (!NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid))
+        next_cf_state = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+
+		if (!next_cf_state) {
 			break;
-
-		/* And now we can form the input tuple. */
-		tuple = heap_form_tuple(tupDesc, values, nulls);
-
-		if (loaded_oid != InvalidOid)
-			HeapTupleSetOid(tuple, loaded_oid);
-
-		/*
-		 * Constraints might reference the tableoid column, so initialize
-		 * t_tableOid before evaluating them.
-		 */
-		tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-
-		/* Triggers and stuff need to be invoked in query context. */
-		MemoryContextSwitchTo(oldcontext);
-
-		/* Place tuple in tuple slot --- but slot shouldn't free it */
-		slot = myslot;
-		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-
-		/* Determine the partition to heap_insert the tuple into */
-		if (cstate->partition_dispatch_info)
-		{
-			int			leaf_part_index;
-			TupleConversionMap *map;
-
-			/*
-			 * Away we go ... If we end up not finding a partition after all,
-			 * ExecFindPartition() does not return and errors out instead.
-			 * Otherwise, the returned value is to be used as an index into
-			 * arrays mt_partitions[] and mt_partition_tupconv_maps[] that
-			 * will get us the ResultRelInfo and TupleConversionMap for the
-			 * partition, respectively.
-			 */
-			leaf_part_index = ExecFindPartition(resultRelInfo,
-												cstate->partition_dispatch_info,
-												slot,
-												estate);
-			Assert(leaf_part_index >= 0 &&
-				   leaf_part_index < cstate->num_partitions);
-
-			/*
-			 * If this tuple is mapped to a partition that is not same as the
-			 * previous one, we'd better make the bulk insert mechanism gets a
-			 * new buffer.
-			 */
-			if (prev_leaf_part_index != leaf_part_index)
-			{
-				ReleaseBulkInsertStatePin(bistate);
-				prev_leaf_part_index = leaf_part_index;
-			}
-
-			/*
-			 * Save the old ResultRelInfo and switch to the one corresponding
-			 * to the selected partition.
-			 */
-			saved_resultRelInfo = resultRelInfo;
-			resultRelInfo = cstate->partitions + leaf_part_index;
-
-			/* We do not yet have a way to insert into a foreign partition */
-			if (resultRelInfo->ri_FdwRoutine)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot route inserted tuples to a foreign table")));
-
-			/*
-			 * For ExecInsertIndexTuples() to work on the partition's indexes
-			 */
-			estate->es_result_relation_info = resultRelInfo;
-
-			/*
-			 * If we're capturing transition tuples, we might need to convert
-			 * from the partition rowtype to parent rowtype.
-			 */
-			if (cstate->transition_capture != NULL)
-			{
-				if (resultRelInfo->ri_TrigDesc &&
-					(resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
-					 resultRelInfo->ri_TrigDesc->trig_insert_instead_row))
-				{
-					/*
-					 * If there are any BEFORE or INSTEAD triggers on the
-					 * partition, we'll have to be ready to convert their
-					 * result back to tuplestore format.
-					 */
-					cstate->transition_capture->tcs_original_insert_tuple = NULL;
-					cstate->transition_capture->tcs_map =
-						cstate->transition_tupconv_maps[leaf_part_index];
-				}
-				else
-				{
-					/*
-					 * Otherwise, just remember the original unconverted
-					 * tuple, to avoid a needless round trip conversion.
-					 */
-					cstate->transition_capture->tcs_original_insert_tuple = tuple;
-					cstate->transition_capture->tcs_map = NULL;
-				}
-			}
-			/*
-			 * We might need to convert from the parent rowtype to the
-			 * partition rowtype.
-			 */
-			map = cstate->partition_tupconv_maps[leaf_part_index];
-			if (map)
-			{
-				Relation	partrel = resultRelInfo->ri_RelationDesc;
-
-				tuple = do_convert_tuple(tuple, map);
-
-				/*
-				 * We must use the partition's tuple descriptor from this
-				 * point on.  Use a dedicated slot from this point on until
-				 * we're finished dealing with the partition.
-				 */
-				slot = cstate->partition_tuple_slot;
-				Assert(slot != NULL);
-				ExecSetSlotDescriptor(slot, RelationGetDescr(partrel));
-				ExecStoreTuple(tuple, slot, InvalidBuffer, true);
-			}
-
-			tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
 		}
+        else if (next_cf_state == NCF_SUCCESS)
+        {
+    		/* And now we can form the input tuple. */
+    		tuple = heap_form_tuple(tupDesc, values, nulls);
 
-		skip_tuple = false;
+    		if (loaded_oid != InvalidOid)
+    			HeapTupleSetOid(tuple, loaded_oid);
 
-		/* BEFORE ROW INSERT Triggers */
-		if (resultRelInfo->ri_TrigDesc &&
-			resultRelInfo->ri_TrigDesc->trig_insert_before_row)
-		{
-			slot = ExecBRInsertTriggers(estate, resultRelInfo, slot);
+    		/*
+    		 * Constraints might reference the tableoid column, so initialize
+    		 * t_tableOid before evaluating them.
+    		 */
+    		tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
 
-			if (slot == NULL)	/* "do nothing" */
-				skip_tuple = true;
-			else				/* trigger might have changed tuple */
-				tuple = ExecMaterializeSlot(slot);
-		}
+    		/* Triggers and stuff need to be invoked in query context. */
+    		MemoryContextSwitchTo(oldcontext);
+
+    		/* Place tuple in tuple slot --- but slot shouldn't free it */
+    		slot = myslot;
+    		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+
+    		/* Determine the partition to heap_insert the tuple into */
+    		if (cstate->partition_dispatch_info)
+    		{
+    			int			leaf_part_index;
+    			TupleConversionMap *map;
+
+    			/*
+    			 * Away we go ... If we end up not finding a partition after all,
+    			 * ExecFindPartition() does not return and errors out instead.
+    			 * Otherwise, the returned value is to be used as an index into
+    			 * arrays mt_partitions[] and mt_partition_tupconv_maps[] that
+    			 * will get us the ResultRelInfo and TupleConversionMap for the
+    			 * partition, respectively.
+    			 */
+    			leaf_part_index = ExecFindPartition(resultRelInfo,
+    												cstate->partition_dispatch_info,
+    												slot,
+    												estate);
+    			Assert(leaf_part_index >= 0 &&
+    				   leaf_part_index < cstate->num_partitions);
+
+    			/*
+    			 * If this tuple is mapped to a partition that is not same as the
+    			 * previous one, we'd better make the bulk insert mechanism gets a
+    			 * new buffer.
+    			 */
+    			if (prev_leaf_part_index != leaf_part_index)
+    			{
+    				ReleaseBulkInsertStatePin(bistate);
+    				prev_leaf_part_index = leaf_part_index;
+    			}
+
+    			/*
+    			 * Save the old ResultRelInfo and switch to the one corresponding
+    			 * to the selected partition.
+    			 */
+    			saved_resultRelInfo = resultRelInfo;
+    			resultRelInfo = cstate->partitions + leaf_part_index;
+
+    			/* We do not yet have a way to insert into a foreign partition */
+    			if (resultRelInfo->ri_FdwRoutine)
+    				ereport(ERROR,
+    						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+    						 errmsg("cannot route inserted tuples to a foreign table")));
+
+    			/*
+    			 * For ExecInsertIndexTuples() to work on the partition's indexes
+    			 */
+    			estate->es_result_relation_info = resultRelInfo;
+
+    			/*
+    			 * If we're capturing transition tuples, we might need to convert
+    			 * from the partition rowtype to parent rowtype.
+    			 */
+    			if (cstate->transition_capture != NULL)
+    			{
+    				if (resultRelInfo->ri_TrigDesc &&
+    					(resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
+    					 resultRelInfo->ri_TrigDesc->trig_insert_instead_row))
+    				{
+    					/*
+    					 * If there are any BEFORE or INSTEAD triggers on the
+    					 * partition, we'll have to be ready to convert their
+    					 * result back to tuplestore format.
+    					 */
+    					cstate->transition_capture->tcs_original_insert_tuple = NULL;
+    					cstate->transition_capture->tcs_map =
+    						cstate->transition_tupconv_maps[leaf_part_index];
+    				}
+    				else
+    				{
+    					/*
+    					 * Otherwise, just remember the original unconverted
+    					 * tuple, to avoid a needless round trip conversion.
+    					 */
+    					cstate->transition_capture->tcs_original_insert_tuple = tuple;
+    					cstate->transition_capture->tcs_map = NULL;
+    				}
+    			}
+    			/*
+    			 * We might need to convert from the parent rowtype to the
+    			 * partition rowtype.
+    			 */
+    			map = cstate->partition_tupconv_maps[leaf_part_index];
+    			if (map)
+    			{
+    				Relation	partrel = resultRelInfo->ri_RelationDesc;
+
+    				tuple = do_convert_tuple(tuple, map);
+
+    				/*
+    				 * We must use the partition's tuple descriptor from this
+    				 * point on.  Use a dedicated slot from this point on until
+    				 * we're finished dealing with the partition.
+    				 */
+    				slot = cstate->partition_tuple_slot;
+    				Assert(slot != NULL);
+    				ExecSetSlotDescriptor(slot, RelationGetDescr(partrel));
+    				ExecStoreTuple(tuple, slot, InvalidBuffer, true);
+    			}
+
+    			tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+    		}
+
+    		skip_tuple = false;
+
+    		/* BEFORE ROW INSERT Triggers */
+    		if (resultRelInfo->ri_TrigDesc &&
+    			resultRelInfo->ri_TrigDesc->trig_insert_before_row)
+    		{
+    			slot = ExecBRInsertTriggers(estate, resultRelInfo, slot);
+
+    			if (slot == NULL)	/* "do nothing" */
+    				skip_tuple = true;
+    			else				/* trigger might have changed tuple */
+    				tuple = ExecMaterializeSlot(slot);
+    		}
+        }
+        else
+        {
+            skip_tuple = true;
+        }
 
 		if (!skip_tuple)
 		{
@@ -3262,7 +3292,7 @@ NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields)
  * relation passed to BeginCopyFrom. This function fills the arrays.
  * Oid of the tuple is returned with 'tupleOid' separately.
  */
-bool
+int
 NextCopyFrom(CopyState cstate, ExprContext *econtext,
 			 Datum *values, bool *nulls, Oid *tupleOid)
 {
@@ -3280,11 +3310,21 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 	int		   *defmap = cstate->defmap;
 	ExprState **defexprs = cstate->defexprs;
 
+    /* Error level for COPY FROM input data errors */
+    int         error_level = ERROR;
+    MemoryContext oldcontext = CurrentMemoryContext;
+
 	tupDesc = RelationGetDescr(cstate->rel);
 	attr = tupDesc->attrs;
 	num_phys_attrs = tupDesc->natts;
 	attr_count = list_length(cstate->attnumlist);
 	nfields = file_has_oids ? (attr_count + 1) : attr_count;
+    
+    /* Set error level to WARNING, if errors handling is turned on */
+    if (cstate->ignore_errors)
+    {
+        error_level = WARNING;
+    }
 
 	/* Initialize all values for row to NULL */
 	MemSet(values, 0, num_phys_attrs * sizeof(Datum));
@@ -3300,13 +3340,17 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 
 		/* read raw fields in the next line */
 		if (!NextCopyFromRawFields(cstate, &field_strings, &fldct))
-			return false;
+			return NCF_STOP;
 
 		/* check for overflowing fields */
 		if (nfields > 0 && fldct > nfields)
-			ereport(ERROR,
+        {
+			ereport(error_level,
 					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-					 errmsg("extra data after last expected column")));
+					 errmsg("extra data after last expected column at line %d", cstate->cur_lineno)));
+            return NCF_SKIP;
+        }
+
 
 		fieldno = 0;
 
@@ -3314,15 +3358,22 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 		if (file_has_oids)
 		{
 			if (fieldno >= fldct)
-				ereport(ERROR,
+            {
+				ereport(error_level,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-						 errmsg("missing data for OID column")));
+						 errmsg("missing data for OID column at line %d", cstate->cur_lineno)));
+                return NCF_SKIP;
+            }
+
 			string = field_strings[fieldno++];
 
 			if (string == NULL)
-				ereport(ERROR,
+            {
+				ereport(error_level,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-						 errmsg("null OID in COPY data")));
+						 errmsg("null OID in COPY data at line %d", cstate->cur_lineno)));
+                return NCF_SKIP;
+            }
 			else if (cstate->oids && tupleOid != NULL)
 			{
 				cstate->cur_attname = "oid";
@@ -3330,9 +3381,13 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 				*tupleOid = DatumGetObjectId(DirectFunctionCall1(oidin,
 																 CStringGetDatum(string)));
 				if (*tupleOid == InvalidOid)
-					ereport(ERROR,
+                {
+					ereport(error_level,
 							(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-							 errmsg("invalid OID in COPY data")));
+							 errmsg("invalid OID in COPY data at line %d", cstate->cur_lineno)));
+                    return NCF_SKIP;
+                }
+
 				cstate->cur_attname = NULL;
 				cstate->cur_attval = NULL;
 			}
@@ -3345,10 +3400,14 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 			int			m = attnum - 1;
 
 			if (fieldno >= fldct)
-				ereport(ERROR,
+            {
+				ereport(error_level,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-						 errmsg("missing data for column \"%s\"",
-								NameStr(attr[m]->attname))));
+						 errmsg("missing data for column \"%s\" at line %d",
+								NameStr(attr[m]->attname), cstate->cur_lineno)));
+                return NCF_SKIP;
+            }
+
 			string = field_strings[fieldno++];
 
 			if (cstate->convert_select_flags &&
@@ -3384,10 +3443,43 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 
 			cstate->cur_attname = NameStr(attr[m]->attname);
 			cstate->cur_attval = string;
+
+            /*
+             * Catch errors inside InputFunctionCall to handle
+             * errors due to the type invalid syntax.
+             */
+            PG_TRY();
+            {
 			values[m] = InputFunctionCall(&in_functions[m],
 										  string,
 										  typioparams[m],
 										  attr[m]->atttypmod);
+            }
+            PG_CATCH();
+            {
+            if (cstate->ignore_errors)
+            {
+                ErrorData  *edata;
+
+                /* Save error info */
+                MemoryContextSwitchTo(oldcontext);
+                edata = CopyErrorData();
+                FlushErrorState();
+
+                /* Propagate catched ERROR sqlerrcode and message as WARNING */
+                ereport(WARNING,
+                        (errcode(edata->sqlerrcode),
+                         errmsg("%s at line %d col %d", edata->message, cstate->cur_lineno, attnum)));
+                return NCF_SKIP;
+            }
+            else
+            {
+                /* Propagate ERROR as is if errors handling is not turned on */
+                PG_RE_THROW();
+            }
+            }
+            PG_END_TRY();
+
 			if (string != NULL)
 				nulls[m] = false;
 			cstate->cur_attname = NULL;
@@ -3407,7 +3499,7 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 		if (!CopyGetInt16(cstate, &fld_count))
 		{
 			/* EOF detected (end of file, or protocol-level EOF) */
-			return false;
+			return NCF_STOP;
 		}
 
 		if (fld_count == -1)
@@ -3431,14 +3523,17 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 				ereport(ERROR,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 						 errmsg("received copy data after EOF marker")));
-			return false;
+			return NCF_STOP;
 		}
 
 		if (fld_count != attr_count)
-			ereport(ERROR,
+        {
+			ereport(error_level,
 					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 					 errmsg("row field count is %d, expected %d",
 							(int) fld_count, attr_count)));
+            return NCF_SKIP;
+        }
 
 		if (file_has_oids)
 		{
@@ -3453,9 +3548,12 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 														 -1,
 														 &isnull));
 			if (isnull || loaded_oid == InvalidOid)
-				ereport(ERROR,
+            {
+				ereport(error_level,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 						 errmsg("invalid OID in COPY data")));
+                return NCF_SKIP;
+            }
 			cstate->cur_attname = NULL;
 			if (cstate->oids && tupleOid != NULL)
 				*tupleOid = loaded_oid;
@@ -3497,7 +3595,7 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 										 &nulls[defmap[i]]);
 	}
 
-	return true;
+	return NCF_SUCCESS;
 }
 
 /*
