@@ -2383,31 +2383,34 @@ CopyFrom(CopyState cstate)
 	Size		bufferedTuplesSize = 0;
 	int			firstBufferedLineNo = 0;
 
-    // BG Worker setup start
-    BackgroundWorker worker;
-    BackgroundWorkerHandle *bgwhandle = NULL;
-	BgwHandleStatus bgwstatus;
-	pid_t		bgwpid;
+    if (!IsBootstrapProcessingMode())
+    {
+        // BG Worker setup start
+        BackgroundWorker worker;
+        BackgroundWorkerHandle *bgwhandle = NULL;
+    	BgwHandleStatus bgwstatus;
+    	pid_t		bgwpid;
 
-    int bgwarg = 3;
+        int bgwarg = 3;
 
-    MemSet(&worker, 0, sizeof(BackgroundWorker));
+        MemSet(&worker, 0, sizeof(BackgroundWorker));
 
-    worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
-		BGWORKER_BACKEND_DATABASE_CONNECTION;
-    worker.bgw_start_time = BgWorkerStart_ConsistentState;
-    worker.bgw_restart_time = BGW_NEVER_RESTART;
-    worker.bgw_notify_pid = MyProcPid;
-    sprintf(worker.bgw_library_name, "postgres");
-    sprintf(worker.bgw_function_name, "CopyFromBgwMainLoop");
+        worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+    		BGWORKER_BACKEND_DATABASE_CONNECTION;
+        worker.bgw_start_time = BgWorkerStart_ConsistentState;
+        worker.bgw_restart_time = BGW_NEVER_RESTART;
+        worker.bgw_notify_pid = MyProcPid;
+        sprintf(worker.bgw_library_name, "postgres");
+        sprintf(worker.bgw_function_name, "CopyFromBgwMainLoop");
 
-    snprintf(worker.bgw_name, BGW_MAXLEN, "copy_from_bgw_pool_worker_%d", 1);
-    worker.bgw_main_arg = Int32GetDatum(bgwarg);
-    RegisterDynamicBackgroundWorker(&worker, &bgwhandle);
-    // BG Worker setup end
+        snprintf(worker.bgw_name, BGW_MAXLEN, "copy_from_bgw_pool_worker_%d", 1);
+        worker.bgw_main_arg = Int32GetDatum(bgwarg);
+        RegisterDynamicBackgroundWorker(&worker, &bgwhandle);
+        // BG Worker setup end
 
-    bgwstatus = WaitForBackgroundWorkerStartup(bgwhandle, &bgwpid);
-    elog(LOG, "Main COPY process (pid %d): BGWorker started (pid %d).", MyProcPid, bgwpid);
+        // bgwstatus = WaitForBackgroundWorkerStartup(bgwhandle, &bgwpid);
+        elog(LOG, "Main COPY process (pid %d): BGWorker started (pid %d).", MyProcPid, bgwpid);
+    }
 
 	Assert(cstate->rel);
 
