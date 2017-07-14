@@ -224,6 +224,8 @@ typedef struct CopyStateData
 	char	   *raw_buf;
 	int			raw_buf_index;	/* next byte to process */
 	int			raw_buf_len;	/* total # of bytes stored */
+
+    bool        allow_parallel;
 } CopyStateData;
 
 /* DestReceiver for COPY (query) TO */
@@ -1409,6 +1411,8 @@ BeginCopy(ParseState *pstate,
 	/* Allocate workspace and zero all fields */
 	cstate = (CopyStateData *) palloc0(sizeof(CopyStateData));
 
+    cstate->allow_parallel = IsNormalProcessingMode() && IsUnderPostmaster;
+
 	/*
 	 * We allocate everything used by a cstate in a new memory context. This
 	 * avoids memory leaks during repeated use of COPY in a query.
@@ -2383,7 +2387,7 @@ CopyFrom(CopyState cstate)
 	Size		bufferedTuplesSize = 0;
 	int			firstBufferedLineNo = 0;
 
-    if (!IsBootstrapProcessingMode())
+    if (cstate->allow_parallel)
     {
         // BG Worker setup start
         BackgroundWorker worker;
@@ -2408,7 +2412,7 @@ CopyFrom(CopyState cstate)
         RegisterDynamicBackgroundWorker(&worker, &bgwhandle);
         // BG Worker setup end
 
-        // bgwstatus = WaitForBackgroundWorkerStartup(bgwhandle, &bgwpid);
+        bgwstatus = WaitForBackgroundWorkerStartup(bgwhandle, &bgwpid);
         elog(LOG, "Main COPY process (pid %d): BGWorker started (pid %d).", MyProcPid, bgwpid);
     }
 
