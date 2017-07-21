@@ -36,18 +36,29 @@
 #include "miscadmin.h"
 #include "optimizer/clauses.h"
 #include "optimizer/planner.h"
+#include "optimizer/cost.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_relation.h"
+#include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "rewrite/rewriteHandler.h"
+#include "storage/dsm.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
+#include "storage/spin.h"
+#include "storage/shm_mq.h"
+#include "storage/shm_toc.h"
+#include "storage/ipc.h"
+#include "storage/procarray.h"
+#include "storage/procsignal.h"
+#include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/portal.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
 
@@ -236,6 +247,51 @@ typedef struct
 	uint64		processed;		/* # of tuples processed */
 } DR_copy;
 
+typedef struct CopyFromStateData
+{
+    CopyState       cstate;
+    HeapTuple       tuple;
+    TupleDesc       tupDesc;
+    Datum           *values;
+    bool            *nulls;
+    ResultRelInfo   *resultRelInfo;
+    ResultRelInfo   *saved_resultRelInfo;
+    EState          *estate;
+    ExprContext     *econtext;
+    TupleTableSlot  *myslot;
+    MemoryContext   oldcontext;
+
+    ErrorContextCallback errcallback;
+    CommandId            mycid;
+    int                  hi_options;
+    BulkInsertState      bistate;
+    uint64               processed;
+    bool                 useHeapMultiInsert;
+    int                  nBufferedTuples;
+    int                  prev_leaf_part_index;
+
+#define MAX_BUFFERED_TUPLES 1000
+    HeapTuple           *bufferedTuples;
+    Size                 bufferedTuplesSize;
+    int                  firstBufferedLineNo;
+} CopyFromStateData;
+
+typedef struct
+{
+    int                     nworkers;
+    BackgroundWorkerHandle *handle[FLEXIBLE_ARRAY_MEMBER];
+} WorkerState;
+
+typedef struct
+{
+    slock_t mutex;
+    int curr_line;
+    int workers_total;
+    int workers_attached;
+    int workers_ready;
+} ParallelState;
+
+#define PG_COPY_FROM_SHM_MQ_MAGIC 0x79fb2447
 
 /*
  * These macros centralize code used to process line_buf and raw_buf buffers.
@@ -302,6 +358,7 @@ if (1) \
 	goto not_end_of_copy; \
 } else ((void) 0)
 
+
 static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 
 
@@ -354,6 +411,23 @@ static void CopySendInt32(CopyState cstate, int32 val);
 static bool CopyGetInt32(CopyState cstate, int32 *val);
 static void CopySendInt16(CopyState cstate, int16 val);
 static bool CopyGetInt16(CopyState cstate, int16 *val);
+
+
+static ParallelState* shm_mq_setup(int64 queue_size, int32 nworkers, 
+                                   dsm_segment **segp, shm_mq_handle **output,
+                                   shm_mq_handle **input);
+static void setup_dynamic_shared_memory(int64 queue_size, int nworkers,
+                                        dsm_segment **segp,
+                                        ParallelState **hdrp,
+                                        shm_mq **outp, shm_mq **inp);
+static WorkerState *setup_background_workers(int nworkers,
+                                             dsm_segment *seg);
+static void cleanup_background_workers(dsm_segment *seg, Datum arg);
+static void wait_for_workers_to_become_ready(WorkerState *wstate,
+                                             volatile ParallelState *pst);
+static bool check_worker_status(WorkerState *wstate);
+
+static void handle_sigterm(SIGNAL_ARGS);
 
 
 /*
@@ -989,7 +1063,16 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 		cstate = BeginCopyFrom(pstate, rel, stmt->filename, stmt->is_program,
 							   NULL, stmt->attlist, stmt->options);
-		*processed = CopyFrom(cstate);	/* copy from file to database */
+
+        if (cstate->allow_parallel)	/* copy from file to database */
+        {
+    		*processed = ParallelCopyFrom(cstate);
+        }
+        else
+        {
+    		*processed = CopyFrom(cstate);
+        }
+
 		EndCopyFrom(cstate);
 	}
 	else
@@ -2342,20 +2425,6 @@ limit_printout_length(const char *str)
 }
 
 /*
- * Copy FROM Background Worker main loop.
- */
-void
-CopyFromBgwMainLoop(Datum main_arg)
-{
-    int i = DatumGetInt32(main_arg);
-    int j;
-    j = i + 1;
-
-    elog(LOG, "BGWorker process: Result: %d", j);
-}
-
-
-/*
  * Copy FROM file to relation.
  */
 uint64
@@ -2386,35 +2455,6 @@ CopyFrom(CopyState cstate)
 	HeapTuple  *bufferedTuples = NULL;	/* initialize to silence warning */
 	Size		bufferedTuplesSize = 0;
 	int			firstBufferedLineNo = 0;
-
-    if (cstate->allow_parallel)
-    {
-        // BG Worker setup start
-        BackgroundWorker worker;
-        BackgroundWorkerHandle *bgwhandle = NULL;
-    	BgwHandleStatus bgwstatus;
-    	pid_t		bgwpid;
-
-        int bgwarg = 3;
-
-        MemSet(&worker, 0, sizeof(BackgroundWorker));
-
-        worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
-    		BGWORKER_BACKEND_DATABASE_CONNECTION;
-        worker.bgw_start_time = BgWorkerStart_ConsistentState;
-        worker.bgw_restart_time = BGW_NEVER_RESTART;
-        worker.bgw_notify_pid = MyProcPid;
-        sprintf(worker.bgw_library_name, "postgres");
-        sprintf(worker.bgw_function_name, "CopyFromBgwMainLoop");
-
-        snprintf(worker.bgw_name, BGW_MAXLEN, "copy_from_bgw_pool_worker_%d", 1);
-        worker.bgw_main_arg = Int32GetDatum(bgwarg);
-        RegisterDynamicBackgroundWorker(&worker, &bgwhandle);
-        // BG Worker setup end
-
-        bgwstatus = WaitForBackgroundWorkerStartup(bgwhandle, &bgwpid);
-        elog(LOG, "Main COPY process (pid %d): BGWorker started (pid %d).", MyProcPid, bgwpid);
-    }
 
 	Assert(cstate->rel);
 
@@ -4975,4 +5015,1031 @@ CreateCopyDestReceiver(void)
 	self->processed = 0;
 
 	return (DestReceiver *) self;
+}
+
+
+
+/*
+ * Copy FROM Background Worker main loop.
+ */
+void
+CopyFromBgwMainLoop(Datum main_arg)
+{
+    volatile ParallelState *hdr;
+    dsm_segment     *seg;
+    shm_toc         *toc;
+    shm_mq_handle   *inqh;
+    shm_mq_handle   *outqh;
+    int              myworkernumber;
+    PGPROC          *registrant;
+    int              prev = 0;
+
+    /*
+     * Establish signal handlers.
+     *
+     * We want CHECK_FOR_INTERRUPTS() to kill off this worker process just as
+     * it would a normal user backend.  To make that happen, we establish a
+     * signal handler that is a stripped-down version of die().
+     */
+    pqsignal(SIGTERM, handle_sigterm);
+    BackgroundWorkerUnblockSignals();
+
+    /*
+     * Connect to the dynamic shared memory segment.
+     *
+     * The backend that registered this worker passed us the ID of a shared
+     * memory segment to which we must attach for further instructions.  In
+     * order to attach to dynamic shared memory, we need a resource owner.
+     * Once we've mapped the segment in our address space, attach to the table
+     * of contents so we can locate the various data structures we'll need to
+     * find within the segment.
+     */
+    CurrentResourceOwner = ResourceOwnerCreate(NULL, "test_shm_mq worker");
+    seg = dsm_attach(DatumGetInt32(main_arg));
+    if (seg == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("unable to map dynamic shared memory segment")));
+    toc = shm_toc_attach(PG_COPY_FROM_SHM_MQ_MAGIC, dsm_segment_address(seg));
+    if (toc == NULL)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("bad magic number in dynamic shared memory segment")));
+
+    /*
+     * Acquire a worker number.
+     *
+     * By convention, the process registering this background worker should
+     * have stored the control structure at key 0.  We look up that key to
+     * find it.  Our worker number gives our identity: there may be just one
+     * worker involved in this parallel operation, or there may be many.
+     */
+    hdr = shm_toc_lookup(toc, 0, false);
+    LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
+    // SpinLockAcquire(&pst->mutex);
+    myworkernumber = ++hdr->workers_attached;
+    // SpinLockRelease(&pst->mutex);
+    LWLockRelease(CopyFromBgwLock);
+    if (myworkernumber > hdr->workers_total)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("too many message queue testing workers already")));
+
+    /*
+     * Attach to the appropriate message queues.
+     */
+    // attach_to_queues(seg, toc, myworkernumber, &inqh, &outqh);
+
+    /*
+     * Indicate that we're fully initialized and ready to begin the main part
+     * of the parallel operation.
+     *
+     * Once we signal that we're ready, the user backend is entitled to assume
+     * that our on_dsm_detach callbacks will fire before we disconnect from
+     * the shared memory segment and exit.  Generally, that means we must have
+     * attached to all relevant dynamic shared memory data structures by now.
+     */
+    LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
+    // SpinLockAcquire(&pst->mutex);
+    ++hdr->workers_ready;
+    elog(LOG, "BGWorker #%d started with curr_line=%d", myworkernumber, hdr->curr_line);
+    // SpinLockRelease(&pst->mutex);
+    LWLockRelease(CopyFromBgwLock);
+    registrant = BackendPidGetProc(MyBgworkerEntry->bgw_notify_pid);
+    if (registrant == NULL)
+    {
+        elog(DEBUG1, "registrant backend has exited prematurely");
+        proc_exit(1);
+    }
+    SetLatch(&registrant->procLatch);
+
+    /* Do the work. */
+    // copy_messages(inqh, outqh);
+    for (;;)
+    {
+        CHECK_FOR_INTERRUPTS();
+
+        LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
+        // SpinLockAcquire(&hdr->mutex);
+        if (hdr->curr_line != prev)
+        {
+            elog(LOG, "BGWorker #%d dummy processing line #%d", myworkernumber, hdr->curr_line);
+        }
+        prev = hdr->curr_line;
+        // SpinLockRelease(&hdr->mutex);
+        LWLockRelease(CopyFromBgwLock);
+    }
+
+    /*
+     * We're done.  Explicitly detach the shared memory segment so that we
+     * don't get a resource leak warning at commit time.  This will fire any
+     * on_dsm_detach callbacks we've registered, as well.  Once that's done,
+     * we can go ahead and exit.
+     */
+    dsm_detach(seg);
+    // proc_exit(1);
+}
+
+/*
+ * When we receive a SIGTERM, we set InterruptPending and ProcDiePending just
+ * like a normal backend.  The next CHECK_FOR_INTERRUPTS() will do the right
+ * thing.
+ */
+static void
+handle_sigterm(SIGNAL_ARGS)
+{
+    int save_errno = errno;
+
+    SetLatch(MyLatch);
+
+    if (!proc_exit_inprogress)
+    {
+        InterruptPending = true;
+        ProcDiePending = true;
+    }
+
+    errno = save_errno;
+}
+
+/*
+ * Set up a dynamic shared memory segment and zero or more background workers
+ * for a test run.
+ */
+static ParallelState*
+shm_mq_setup(int64 queue_size, int32 nworkers, dsm_segment **segp,
+                  shm_mq_handle **output, shm_mq_handle **input)
+{
+    dsm_segment *seg;
+    ParallelState *hdr;
+    shm_mq       *outq = NULL;    /* placate compiler */
+    shm_mq       *inq = NULL;        /* placate compiler */
+    WorkerState *wstate;
+
+    /* Set up a dynamic shared memory segment. */
+    setup_dynamic_shared_memory(queue_size, nworkers, &seg, &hdr, &outq, &inq);
+    *segp = seg;
+
+    /* Register background workers. */
+    wstate = setup_background_workers(nworkers, seg);
+
+    /* Attach the queues. */
+    *output = shm_mq_attach(outq, seg, wstate->handle[0]);
+    *input = shm_mq_attach(inq, seg, wstate->handle[nworkers - 1]);
+
+    /* Wait for workers to become ready. */
+    wait_for_workers_to_become_ready(wstate, hdr);
+
+    /*
+     * Once we reach this point, all workers are ready.  We no longer need to
+     * kill them if we die; they'll die on their own as the message queues
+     * shut down.
+     */
+    // cancel_on_dsm_detach(seg, cleanup_background_workers,
+    //                      PointerGetDatum(wstate));
+    // pfree(wstate);
+
+    return hdr;
+}
+
+/*
+ * Set up a dynamic shared memory segment.
+ *
+ * We set up a small control region that contains only a test_shm_mq_header,
+ * plus one region per message queue.  There are as many message queues as
+ * the number of workers, plus one.
+ */
+static void
+setup_dynamic_shared_memory(int64 queue_size, int nworkers,
+                            dsm_segment **segp, ParallelState **hdrp,
+                            shm_mq **outp, shm_mq **inp)
+{
+    shm_toc_estimator e;
+    int            i;
+    Size        segsize;
+    dsm_segment *seg;
+    shm_toc    *toc;
+    ParallelState *hdr;
+
+    /* Ensure a valid queue size. */
+    if (queue_size < 0 || ((uint64) queue_size) < shm_mq_minimum_size)
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("queue size must be at least %zu bytes",
+                        shm_mq_minimum_size)));
+    if (queue_size != ((Size) queue_size))
+        ereport(ERROR,
+                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                 errmsg("queue size overflows size_t")));
+
+    /*
+     * Estimate how much shared memory we need.
+     *
+     * Because the TOC machinery may choose to insert padding of oddly-sized
+     * requests, we must estimate each chunk separately.
+     *
+     * We need one key to register the location of the header, and we need
+     * nworkers + 1 keys to track the locations of the message queues.
+     */
+    shm_toc_initialize_estimator(&e);
+    shm_toc_estimate_chunk(&e, sizeof(ParallelState));
+    for (i = 0; i <= nworkers; ++i)
+        shm_toc_estimate_chunk(&e, (Size) queue_size);
+    shm_toc_estimate_keys(&e, 2 + nworkers);
+    segsize = shm_toc_estimate(&e);
+
+    /* Create the shared memory segment and establish a table of contents. */
+    seg = dsm_create(shm_toc_estimate(&e), 0);
+    toc = shm_toc_create(PG_COPY_FROM_SHM_MQ_MAGIC, dsm_segment_address(seg),
+                         segsize);
+
+    /* Set up the header region. */
+    hdr = shm_toc_allocate(toc, sizeof(ParallelState));
+    SpinLockInit(&hdr->mutex);
+    hdr->workers_total = nworkers;
+    hdr->workers_attached = 0;
+    hdr->workers_ready = 0;
+    shm_toc_insert(toc, 0, hdr);
+
+    /* Set up one message queue per worker, plus one. */
+    for (i = 0; i <= nworkers; ++i)
+    {
+        shm_mq       *mq;
+
+        mq = shm_mq_create(shm_toc_allocate(toc, (Size) queue_size),
+                           (Size) queue_size);
+        shm_toc_insert(toc, i + 1, mq);
+
+        if (i == 0)
+        {
+            /* We send messages to the first queue. */
+            shm_mq_set_sender(mq, MyProc);
+            *outp = mq;
+        }
+        if (i == nworkers)
+        {
+            /* We receive messages from the last queue. */
+            shm_mq_set_receiver(mq, MyProc);
+            *inp = mq;
+        }
+    }
+
+    /* Return results to caller. */
+    *segp = seg;
+    *hdrp = hdr;
+}
+
+/*
+ * Register background workers.
+ */
+static WorkerState *
+setup_background_workers(int nworkers, dsm_segment *seg)
+{
+    MemoryContext       oldcontext;
+    BackgroundWorker    worker;
+    WorkerState        *wstate;
+    int                 i;
+
+    /*
+     * We need the worker_state object and the background worker handles to
+     * which it points to be allocated in CurTransactionContext rather than
+     * ExprContext; otherwise, they'll be destroyed before the on_dsm_detach
+     * hooks run.
+     */
+    oldcontext = MemoryContextSwitchTo(CurTransactionContext);
+
+    /* Create worker state object. */
+    wstate = MemoryContextAlloc(TopTransactionContext,
+                                offsetof(WorkerState, handle) +
+                                sizeof(BackgroundWorkerHandle *) * nworkers);
+    wstate->nworkers = 0;
+
+    /*
+     * Arrange to kill all the workers if we abort before all workers are
+     * finished hooking themselves up to the dynamic shared memory segment.
+     *
+     * If we die after all the workers have finished hooking themselves up to
+     * the dynamic shared memory segment, we'll mark the two queues to which
+     * we're directly connected as detached, and the worker(s) connected to
+     * those queues will exit, marking any other queues to which they are
+     * connected as detached.  This will cause any as-yet-unaware workers
+     * connected to those queues to exit in their turn, and so on, until
+     * everybody exits.
+     *
+     * But suppose the workers which are supposed to connect to the queues to
+     * which we're directly attached exit due to some error before they
+     * actually attach the queues.  The remaining workers will have no way of
+     * knowing this.  From their perspective, they're still waiting for those
+     * workers to start, when in fact they've already died.
+     */
+    on_dsm_detach(seg, cleanup_background_workers,
+                  PointerGetDatum(wstate));
+
+    /* Configure a worker. */
+    MemSet(&worker, 0, sizeof(BackgroundWorker));
+
+    worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+      BGWORKER_BACKEND_DATABASE_CONNECTION;
+    worker.bgw_start_time = BgWorkerStart_ConsistentState;
+    worker.bgw_restart_time = BGW_NEVER_RESTART;
+    worker.bgw_notify_pid = MyProcPid;
+    sprintf(worker.bgw_library_name, "postgres");
+    sprintf(worker.bgw_function_name, "CopyFromBgwMainLoop");
+
+    worker.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(seg));
+
+    /* Register the workers. */
+    for (i = 0; i < nworkers; ++i)
+    {
+        snprintf(worker.bgw_name, BGW_MAXLEN, "copy_from_bgw_pool_worker_%d", i);
+        if (!RegisterDynamicBackgroundWorker(&worker, &wstate->handle[i]))
+            ereport(ERROR,
+                    (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+                     errmsg("could not register background process"),
+                     errhint("You may need to increase max_worker_processes.")));
+        ++wstate->nworkers;
+    }
+
+    /* All done. */
+    MemoryContextSwitchTo(oldcontext);
+    return wstate;
+}
+
+static void
+cleanup_background_workers(dsm_segment *seg, Datum arg)
+{
+    WorkerState *wstate = (WorkerState *) DatumGetPointer(arg);
+
+    while (wstate->nworkers > 0)
+    {
+        --wstate->nworkers;
+        TerminateBackgroundWorker(wstate->handle[wstate->nworkers]);
+    }
+}
+
+static void
+wait_for_workers_to_become_ready(WorkerState *wstate,
+                                 volatile ParallelState *pst)
+{
+    bool result = false;
+
+    for (;;)
+    {
+        int workers_ready;
+
+        /* If all the workers are ready, we have succeeded. */
+        LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
+        // SpinLockAcquire(&pst->mutex);
+        workers_ready = pst->workers_ready;
+        // SpinLockRelease(&pst->mutex);
+        LWLockRelease(CopyFromBgwLock);
+        // LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
+        // workers_ready = pst->workers_ready;
+        // LWLockRelease(CopyFromBgwLock);
+        if (workers_ready >= wstate->nworkers)
+        {
+            result = true;
+            break;
+        }
+
+        /* If any workers (or the postmaster) have died, we have failed. */
+        if (!check_worker_status(wstate))
+        {
+            result = false;
+            break;
+        }
+
+        /* Wait to be signalled. */
+        WaitLatch(MyLatch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
+
+        /* Reset the latch so we don't spin. */
+        ResetLatch(MyLatch);
+
+        /* An interrupt may have occurred while we were waiting. */
+        CHECK_FOR_INTERRUPTS();
+    }
+
+    if (!result)
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+                 errmsg("one or more background workers failed to start")));
+}
+
+static bool
+check_worker_status(WorkerState *wstate)
+{
+    int n;
+
+    /* If any workers (or the postmaster) have died, we have failed. */
+    for (n = 0; n < wstate->nworkers; ++n)
+    {
+        BgwHandleStatus status;
+        pid_t           pid;
+
+        status = GetBackgroundWorkerPid(wstate->handle[n], &pid);
+        if (status == BGWH_STOPPED || status == BGWH_POSTMASTER_DIED)
+            return false;
+    }
+
+    /* Otherwise, things still look OK. */
+    return true;
+}
+
+
+/*
+ * Parallel Copy FROM file to relation.
+ */
+extern uint64
+ParallelCopyFrom(CopyState cstate)
+{
+    CopyFromState   cfstate;
+    ParallelState  *pst;
+    dsm_segment    *seg;
+    shm_mq_handle  *outqh;
+    shm_mq_handle  *inqh;
+    shm_mq_result   res;
+    int64           queue_size = 64;
+    int32           nworkers = max_parallel_workers_per_gather;
+
+    cfstate = (CopyFromStateData *) palloc0(sizeof(CopyFromStateData));
+
+    cfstate->cstate = cstate;
+	cfstate->estate = CreateExecutorState(); /* for ExecConstraints() */
+	cfstate->oldcontext = CurrentMemoryContext;
+	cfstate->mycid = GetCurrentCommandId(true);
+    
+	cfstate->saved_resultRelInfo = NULL;
+	cfstate->hi_options = 0; /* start with default heap_insert options */
+    cfstate->processed = 0;
+    cfstate->nBufferedTuples = 0;
+    cfstate->prev_leaf_part_index = -1;
+    cfstate->bufferedTuples = NULL;	/* initialize to silence warning */
+    cfstate->bufferedTuplesSize = 0;
+    cfstate->firstBufferedLineNo = 0;
+        
+
+    // BG Worker setup start
+    // BackgroundWorker        worker;
+    // BackgroundWorkerHandle *bgwhandle = NULL;
+    // BgwHandleStatus         bgwstatus;
+    // pid_t                   bgwpid;
+    // int                     bgwarg = 5;
+    //
+    // elog(LOG, "Main COPY process (pid %d): starting BGWorker", MyProcPid);
+    // MemSet(&worker, 0, sizeof(BackgroundWorker));
+    //
+    // worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+    //     BGWORKER_BACKEND_DATABASE_CONNECTION;
+    // worker.bgw_start_time = BgWorkerStart_ConsistentState;
+    // worker.bgw_restart_time = BGW_NEVER_RESTART;
+    // worker.bgw_notify_pid = MyProcPid;
+    // sprintf(worker.bgw_library_name, "postgres");
+    // sprintf(worker.bgw_function_name, "CopyFromBgwMainLoop");
+    //
+    // snprintf(worker.bgw_name, BGW_MAXLEN, "copy_from_bgw_pool_worker_%d", 1);
+    // // worker.bgw_main_arg = PointerGetDatum(cfstate);
+    // worker.bgw_main_arg = PointerGetDatum(&bgwarg);
+    // BG Worker setup end
+
+	Assert(cfstate->cstate->rel);
+
+    pst = shm_mq_setup(queue_size, nworkers, &seg, &outqh, &inqh);
+
+	/*
+	 * The target must be a plain relation or have an INSTEAD OF INSERT row
+	 * trigger.  (Currently, such triggers are only allowed on views, so we
+	 * only hint about them in the view case.)
+	 */
+	if (cfstate->cstate->rel->rd_rel->relkind != RELKIND_RELATION &&
+		cfstate->cstate->rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
+		!(cfstate->cstate->rel->trigdesc &&
+		  cfstate->cstate->rel->trigdesc->trig_insert_instead_row))
+	{
+		if (cfstate->cstate->rel->rd_rel->relkind == RELKIND_VIEW)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot copy to view \"%s\"",
+							RelationGetRelationName(cfstate->cstate->rel)),
+					 errhint("To enable copying to a view, provide an INSTEAD OF INSERT trigger.")));
+		else if (cfstate->cstate->rel->rd_rel->relkind == RELKIND_MATVIEW)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot copy to materialized view \"%s\"",
+							RelationGetRelationName(cfstate->cstate->rel))));
+		else if (cfstate->cstate->rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot copy to foreign table \"%s\"",
+							RelationGetRelationName(cfstate->cstate->rel))));
+		else if (cfstate->cstate->rel->rd_rel->relkind == RELKIND_SEQUENCE)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot copy to sequence \"%s\"",
+							RelationGetRelationName(cfstate->cstate->rel))));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot copy to non-table relation \"%s\"",
+							RelationGetRelationName(cfstate->cstate->rel))));
+	}
+
+	cfstate->tupDesc = RelationGetDescr(cfstate->cstate->rel);
+
+	/*----------
+	 * Check to see if we can avoid writing WAL
+	 *
+	 * If archive logging/streaming is not enabled *and* either
+	 *	- table was created in same transaction as this COPY
+	 *	- data is being written to relfilenode created in this transaction
+	 * then we can skip writing WAL.  It's safe because if the transaction
+	 * doesn't commit, we'll discard the table (or the new relfilenode file).
+	 * If it does commit, we'll have done the heap_sync at the bottom of this
+	 * routine first.
+	 *
+	 * As mentioned in comments in utils/rel.h, the in-same-transaction test
+	 * is not always set correctly, since in rare cases rd_newRelfilenodeSubid
+	 * can be cleared before the end of the transaction. The exact case is
+	 * when a relation sets a new relfilenode twice in same transaction, yet
+	 * the second one fails in an aborted subtransaction, e.g.
+	 *
+	 * BEGIN;
+	 * TRUNCATE t;
+	 * SAVEPOINT save;
+	 * TRUNCATE t;
+	 * ROLLBACK TO save;
+	 * COPY ...
+	 *
+	 * Also, if the target file is new-in-transaction, we assume that checking
+	 * FSM for free space is a waste of time, even if we must use WAL because
+	 * of archiving.  This could possibly be wrong, but it's unlikely.
+	 *
+	 * The comments for heap_insert and RelationGetBufferForTuple specify that
+	 * skipping WAL logging is only safe if we ensure that our tuples do not
+	 * go into pages containing tuples from any other transactions --- but this
+	 * must be the case if we have a new table or new relfilenode, so we need
+	 * no additional work to enforce that.
+	 *----------
+	 */
+	/* createSubid is creation check, newRelfilenodeSubid is truncation check */
+	if (cfstate->cstate->rel->rd_createSubid != InvalidSubTransactionId ||
+		cfstate->cstate->rel->rd_newRelfilenodeSubid != InvalidSubTransactionId)
+	{
+		cfstate->hi_options |= HEAP_INSERT_SKIP_FSM;
+		if (!XLogIsNeeded())
+			cfstate->hi_options |= HEAP_INSERT_SKIP_WAL;
+	}
+
+	/*
+	 * Optimize if new relfilenode was created in this subxact or one of its
+	 * committed children and we won't see those rows later as part of an
+	 * earlier scan or command. This ensures that if this subtransaction
+	 * aborts then the frozen rows won't be visible after xact cleanup. Note
+	 * that the stronger test of exactly which subtransaction created it is
+	 * crucial for correctness of this optimization.
+	 */
+	if (cfstate->cstate->freeze)
+	{
+		if (!ThereAreNoPriorRegisteredSnapshots() || !ThereAreNoReadyPortals())
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+					 errmsg("cannot perform FREEZE because of prior transaction activity")));
+
+		if (cfstate->cstate->rel->rd_createSubid != GetCurrentSubTransactionId() &&
+			cfstate->cstate->rel->rd_newRelfilenodeSubid != GetCurrentSubTransactionId())
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot perform FREEZE because the table was not created or truncated in the current subtransaction")));
+
+		cfstate->hi_options |= HEAP_INSERT_FROZEN;
+	}
+
+	/*
+	 * We need a ResultRelInfo so we can use the regular executor's
+	 * index-entry-making machinery.  (There used to be a huge amount of code
+	 * here that basically duplicated execUtils.c ...)
+	 */
+	cfstate->resultRelInfo = makeNode(ResultRelInfo);
+	InitResultRelInfo(cfstate->resultRelInfo,
+					  cfstate->cstate->rel,
+					  1,		/* dummy rangetable index */
+					  NULL,
+					  0);
+
+	ExecOpenIndices(cfstate->resultRelInfo, false);
+
+	cfstate->estate->es_result_relations = cfstate->resultRelInfo;
+	cfstate->estate->es_num_result_relations = 1;
+	cfstate->estate->es_result_relation_info = cfstate->resultRelInfo;
+	cfstate->estate->es_range_table = cfstate->cstate->range_table;
+
+	/* Set up a tuple slot too */
+	cfstate->myslot = ExecInitExtraTupleSlot(cfstate->estate);
+	ExecSetSlotDescriptor(cfstate->myslot, cfstate->tupDesc);
+	/* Triggers might need a slot as well */
+	cfstate->estate->es_trig_tuple_slot = ExecInitExtraTupleSlot(cfstate->estate);
+
+	/*
+	 * It's more efficient to prepare a bunch of tuples for insertion, and
+	 * insert them in one heap_multi_insert() call, than call heap_insert()
+	 * separately for every tuple. However, we can't do that if there are
+	 * BEFORE/INSTEAD OF triggers, or we need to evaluate volatile default
+	 * expressions. Such triggers or expressions might query the table we're
+	 * inserting to, and act differently if the tuples that have already been
+	 * cfstate->processed and prepared for insertion are not there.  We also can't do
+	 * it if the table is partitioned.
+	 */
+	if ((cfstate->resultRelInfo->ri_TrigDesc != NULL &&
+		 (cfstate->resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
+		  cfstate->resultRelInfo->ri_TrigDesc->trig_insert_instead_row)) ||
+		cfstate->cstate->partition_dispatch_info != NULL ||
+		cfstate->cstate->volatile_defexprs)
+	{
+		cfstate->useHeapMultiInsert = false;
+	}
+	else
+	{
+		cfstate->useHeapMultiInsert = true;
+		cfstate->bufferedTuples = palloc(MAX_BUFFERED_TUPLES * sizeof(HeapTuple));
+	}
+
+	/* Prepare to catch AFTER triggers. */
+	AfterTriggerBeginQuery();
+
+	/*
+	 * Check BEFORE STATEMENT insertion triggers. It's debatable whether we
+	 * should do this for COPY, since it's not really an "INSERT" statement as
+	 * such. However, executing these triggers maintains consistency with the
+	 * EACH ROW triggers that we already fire on COPY.
+	 */
+	ExecBSInsertTriggers(cfstate->estate, cfstate->resultRelInfo);
+
+	cfstate->values = (Datum *) palloc(cfstate->tupDesc->natts * sizeof(Datum));
+	cfstate->nulls = (bool *) palloc(cfstate->tupDesc->natts * sizeof(bool));
+
+	cfstate->bistate = GetBulkInsertState();
+	cfstate->econtext = GetPerTupleExprContext(cfstate->estate);
+
+	/* Set up callback to identify error line number */
+	cfstate->errcallback.callback = CopyFromErrorCallback;
+	cfstate->errcallback.arg = (void *) cfstate->cstate;
+	cfstate->errcallback.previous = error_context_stack;
+	error_context_stack = &cfstate->errcallback;
+
+    // // BG Worker startup
+    // RegisterDynamicBackgroundWorker(&worker, &bgwhandle);
+    // bgwstatus = WaitForBackgroundWorkerStartup(bgwhandle, &bgwpid);
+    // elog(LOG, "Main COPY process (pid %d): BGWorker started (pid %d)", MyProcPid, bgwpid);
+    // // BG Worker startup
+
+	for (;;)
+	{
+		TupleTableSlot *slot;
+		bool		skip_tuple;
+		Oid			loaded_oid = InvalidOid;
+        int         next_cf_state; /* NextCopyFrom return state */
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (cfstate->nBufferedTuples == 0)
+		{
+			/*
+			 * Reset the per-tuple exprcontext. We can only do this if the
+			 * tuple buffer is empty. (Calling the context the per-tuple
+			 * memory context is a bit of a misnomer now.)
+			 */
+			ResetPerTupleExprContext(cfstate->estate);
+		}
+
+		/* Switch into its memory context */
+		MemoryContextSwitchTo(GetPerTupleMemoryContext(cfstate->estate));
+
+        next_cf_state = NextCopyFrom(cfstate->cstate, cfstate->econtext, cfstate->values, cfstate->nulls, &loaded_oid);
+
+
+        LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
+        // SpinLockAcquire(&pst->mutex);
+        pst->curr_line++;
+        // SpinLockRelease(&pst->mutex);
+        LWLockRelease(CopyFromBgwLock);
+
+		if (!next_cf_state) {
+			break;
+		}
+        else if (next_cf_state == NCF_SUCCESS)
+        {
+    		/* And now we can form the input tuple. */
+    		cfstate->tuple = heap_form_tuple(cfstate->tupDesc, cfstate->values, cfstate->nulls);
+
+    		if (loaded_oid != InvalidOid)
+    			HeapTupleSetOid(cfstate->tuple, loaded_oid);
+
+    		/*
+    		 * Constraints might reference the tableoid column, so initialize
+    		 * t_tableOid before evaluating them.
+    		 */
+    		cfstate->tuple->t_tableOid = RelationGetRelid(cfstate->resultRelInfo->ri_RelationDesc);
+
+    		/* Triggers and stuff need to be invoked in query context. */
+    		MemoryContextSwitchTo(cfstate->oldcontext);
+
+    		/* Place tuple in tuple slot --- but slot shouldn't free it */
+    		slot = cfstate->myslot;
+    		ExecStoreTuple(cfstate->tuple, slot, InvalidBuffer, false);
+
+    		/* Determine the partition to heap_insert the tuple into */
+    		if (cfstate->cstate->partition_dispatch_info)
+    		{
+    			int			leaf_part_index;
+    			TupleConversionMap *map;
+
+    			/*
+    			 * Away we go ... If we end up not finding a partition after all,
+    			 * ExecFindPartition() does not return and errors out instead.
+    			 * Otherwise, the returned value is to be used as an index into
+    			 * arrays mt_partitions[] and mt_partition_tupconv_maps[] that
+    			 * will get us the ResultRelInfo and TupleConversionMap for the
+    			 * partition, respectively.
+    			 */
+    			leaf_part_index = ExecFindPartition(cfstate->resultRelInfo,
+    												cfstate->cstate->partition_dispatch_info,
+    												slot,
+    												cfstate->estate);
+    			Assert(leaf_part_index >= 0 &&
+    				   leaf_part_index < cfstate->cstate->num_partitions);
+
+    			/*
+    			 * If this tuple is mapped to a partition that is not same as the
+    			 * previous one, we'd better make the bulk insert mechanism gets a
+    			 * new buffer.
+    			 */
+    			if (cfstate->prev_leaf_part_index != leaf_part_index)
+    			{
+    				ReleaseBulkInsertStatePin(cfstate->bistate);
+    				cfstate->prev_leaf_part_index = leaf_part_index;
+    			}
+
+    			/*
+    			 * Save the old ResultRelInfo and switch to the one corresponding
+    			 * to the selected partition.
+    			 */
+    			cfstate->saved_resultRelInfo = cfstate->resultRelInfo;
+    			cfstate->resultRelInfo = cfstate->cstate->partitions + leaf_part_index;
+
+    			/* We do not yet have a way to insert into a foreign partition */
+    			if (cfstate->resultRelInfo->ri_FdwRoutine)
+    				ereport(ERROR,
+    						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+    						 errmsg("cannot route inserted tuples to a foreign table")));
+
+    			/*
+    			 * For ExecInsertIndexTuples() to work on the partition's indexes
+    			 */
+    			cfstate->estate->es_result_relation_info = cfstate->resultRelInfo;
+
+    			/*
+    			 * If we're capturing transition tuples, we might need to convert
+    			 * from the partition rowtype to parent rowtype.
+    			 */
+    			if (cfstate->cstate->transition_capture != NULL)
+    			{
+    				if (cfstate->resultRelInfo->ri_TrigDesc &&
+    					(cfstate->resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
+    					 cfstate->resultRelInfo->ri_TrigDesc->trig_insert_instead_row))
+    				{
+    					/*
+    					 * If there are any BEFORE or INSTEAD triggers on the
+    					 * partition, we'll have to be ready to convert their
+    					 * result back to tuplestore format.
+    					 */
+    					cfstate->cstate->transition_capture->tcs_original_insert_tuple = NULL;
+    					cfstate->cstate->transition_capture->tcs_map =
+    						cfstate->cstate->transition_tupconv_maps[leaf_part_index];
+    				}
+    				else
+    				{
+    					/*
+    					 * Otherwise, just remember the original unconverted
+    					 * tuple, to avoid a needless round trip conversion.
+    					 */
+    					cfstate->cstate->transition_capture->tcs_original_insert_tuple = cfstate->tuple;
+    					cfstate->cstate->transition_capture->tcs_map = NULL;
+    				}
+    			}
+    			/*
+    			 * We might need to convert from the parent rowtype to the
+    			 * partition rowtype.
+    			 */
+    			map = cfstate->cstate->partition_tupconv_maps[leaf_part_index];
+    			if (map)
+    			{
+    				Relation	partrel = cfstate->resultRelInfo->ri_RelationDesc;
+
+    				cfstate->tuple = do_convert_tuple(cfstate->tuple, map);
+
+    				/*
+    				 * We must use the partition's tuple descriptor from this
+    				 * point on.  Use a dedicated slot from this point on until
+    				 * we're finished dealing with the partition.
+    				 */
+    				slot = cfstate->cstate->partition_tuple_slot;
+    				Assert(slot != NULL);
+    				ExecSetSlotDescriptor(slot, RelationGetDescr(partrel));
+    				ExecStoreTuple(cfstate->tuple, slot, InvalidBuffer, true);
+    			}
+
+    			cfstate->tuple->t_tableOid = RelationGetRelid(cfstate->resultRelInfo->ri_RelationDesc);
+    		}
+
+    		skip_tuple = false;
+
+    		/* BEFORE ROW INSERT Triggers */
+    		if (cfstate->resultRelInfo->ri_TrigDesc &&
+    			cfstate->resultRelInfo->ri_TrigDesc->trig_insert_before_row)
+    		{
+    			slot = ExecBRInsertTriggers(cfstate->estate, cfstate->resultRelInfo, slot);
+
+    			if (slot == NULL)	/* "do nothing" */
+    				skip_tuple = true;
+    			else				/* trigger might have changed tuple */
+    				cfstate->tuple = ExecMaterializeSlot(slot);
+    		}
+        }
+        else
+        {
+            skip_tuple = true;
+        }
+
+		if (!skip_tuple)
+		{
+			if (cfstate->resultRelInfo->ri_TrigDesc &&
+				cfstate->resultRelInfo->ri_TrigDesc->trig_insert_instead_row)
+			{
+				/* Pass the data to the INSTEAD ROW INSERT trigger */
+				ExecIRInsertTriggers(cfstate->estate, cfstate->resultRelInfo, slot);
+			}
+			else
+			{
+				/*
+				 * We always check the partition constraint, including when
+				 * the tuple got here via tuple-routing.  However we don't
+				 * need to in the latter case if no BR trigger is defined on
+				 * the partition.  Note that a BR trigger might modify the
+				 * tuple such that the partition constraint is no longer
+				 * satisfied, so we need to check in that case.
+				 */
+				bool		check_partition_constr =
+				(cfstate->resultRelInfo->ri_PartitionCheck != NIL);
+
+				if (cfstate->saved_resultRelInfo != NULL &&
+					!(cfstate->resultRelInfo->ri_TrigDesc &&
+					  cfstate->resultRelInfo->ri_TrigDesc->trig_insert_before_row))
+					check_partition_constr = false;
+
+				/* Check the constraints of the tuple */
+				if (cfstate->cstate->rel->rd_att->constr || check_partition_constr)
+					ExecConstraints(cfstate->resultRelInfo, slot, cfstate->estate);
+
+				if (cfstate->useHeapMultiInsert)
+				{
+					/* Add this tuple to the tuple buffer */
+					if (cfstate->nBufferedTuples == 0)
+						cfstate->firstBufferedLineNo = cfstate->cstate->cur_lineno;
+					cfstate->bufferedTuples[cfstate->nBufferedTuples++] = cfstate->tuple;
+					cfstate->bufferedTuplesSize += cfstate->tuple->t_len;
+
+					/*
+					 * If the buffer filled up, flush it.  Also flush if the
+					 * total size of all the tuples in the buffer becomes
+					 * large, to avoid using large amounts of memory for the
+					 * buffer when the tuples are exceptionally wide.
+					 */
+					if (cfstate->nBufferedTuples == MAX_BUFFERED_TUPLES ||
+						cfstate->bufferedTuplesSize > 65535)
+					{
+						CopyFromInsertBatch(cfstate->cstate, cfstate->estate, cfstate->mycid, cfstate->hi_options,
+											cfstate->resultRelInfo, cfstate->myslot, cfstate->bistate,
+											cfstate->nBufferedTuples, cfstate->bufferedTuples,
+											cfstate->firstBufferedLineNo);
+						cfstate->nBufferedTuples = 0;
+						cfstate->bufferedTuplesSize = 0;
+					}
+				}
+				else
+				{
+					List	   *recheckIndexes = NIL;
+
+					/* OK, store the tuple and create index entries for it */
+					heap_insert(cfstate->resultRelInfo->ri_RelationDesc, cfstate->tuple, cfstate->mycid,
+								cfstate->hi_options, cfstate->bistate);
+
+					if (cfstate->resultRelInfo->ri_NumIndices > 0)
+						recheckIndexes = ExecInsertIndexTuples(slot,
+															   &(cfstate->tuple->t_self),
+															   cfstate->estate,
+															   false,
+															   NULL,
+															   NIL);
+
+					/* AFTER ROW INSERT Triggers */
+					ExecARInsertTriggers(cfstate->estate, cfstate->resultRelInfo, cfstate->tuple,
+										 recheckIndexes, cfstate->cstate->transition_capture);
+
+					list_free(recheckIndexes);
+				}
+			}
+
+			/*
+			 * We count only tuples not suppressed by a BEFORE INSERT trigger;
+			 * this is the same definition used by execMain.c for counting
+			 * tuples inserted by an INSERT command.
+			 */
+			cfstate->processed++;
+
+			if (cfstate->saved_resultRelInfo)
+			{
+				cfstate->resultRelInfo = cfstate->saved_resultRelInfo;
+				cfstate->estate->es_result_relation_info = cfstate->resultRelInfo;
+			}
+		}
+	}
+
+	/* Flush any remaining buffered tuples */
+	if (cfstate->nBufferedTuples > 0)
+		CopyFromInsertBatch(cfstate->cstate, cfstate->estate, cfstate->mycid, cfstate->hi_options,
+							cfstate->resultRelInfo, cfstate->myslot, cfstate->bistate,
+							cfstate->nBufferedTuples, cfstate->bufferedTuples,
+							cfstate->firstBufferedLineNo);
+
+	/* Done, clean up */
+	error_context_stack = cfstate->errcallback.previous;
+
+	FreeBulkInsertState(cfstate->bistate);
+
+	MemoryContextSwitchTo(cfstate->oldcontext);
+
+	/*
+	 * In the old protocol, tell pqcomm that we can process normal protocol
+	 * messages again.
+	 */
+	if (cfstate->cstate->copy_dest == COPY_OLD_FE)
+		pq_endmsgread();
+
+	/* Execute AFTER STATEMENT insertion triggers */
+	ExecASInsertTriggers(cfstate->estate, cfstate->resultRelInfo, cfstate->cstate->transition_capture);
+
+	/* Handle queued AFTER triggers */
+	AfterTriggerEndQuery(cfstate->estate);
+
+	pfree(cfstate->values);
+	pfree(cfstate->nulls);
+
+	ExecResetTupleTable(cfstate->estate->es_tupleTable, false);
+
+	ExecCloseIndices(cfstate->resultRelInfo);
+
+	/* Close all the partitioned tables, leaf partitions, and their indices */
+	if (cfstate->cstate->partition_dispatch_info)
+	{
+		int			i;
+
+		/*
+		 * Remember cfstate->cstate->partition_dispatch_info[0] corresponds to the root
+		 * partitioned table, which we must not try to close, because it is
+		 * the main target table of COPY that will be closed eventually by
+		 * DoCopy().  Also, tupslot is NULL for the root partitioned table.
+		 */
+		for (i = 1; i < cfstate->cstate->num_dispatch; i++)
+		{
+			PartitionDispatch pd = cfstate->cstate->partition_dispatch_info[i];
+
+			heap_close(pd->reldesc, NoLock);
+			ExecDropSingleTupleTableSlot(pd->tupslot);
+		}
+		for (i = 0; i < cfstate->cstate->num_partitions; i++)
+		{
+			ResultRelInfo *resultRelInfo = cfstate->cstate->partitions + i;
+
+			ExecCloseIndices(resultRelInfo);
+			heap_close(resultRelInfo->ri_RelationDesc, NoLock);
+		}
+
+		/* Release the standalone partition tuple descriptor */
+		ExecDropSingleTupleTableSlot(cfstate->cstate->partition_tuple_slot);
+	}
+
+	/* Close any trigger target relations */
+	ExecCleanUpTriggerState(cfstate->estate);
+
+	FreeExecutorState(cfstate->estate);
+
+	/*
+	 * If we skipped writing WAL, then we need to sync the heap (but not
+	 * indexes since those use WAL anyway)
+	 */
+	if (cfstate->hi_options & HEAP_INSERT_SKIP_WAL)
+		heap_sync(cfstate->cstate->rel);
+
+    /* Clean up. */
+    dsm_detach(seg);
+
+	return cfstate->processed;
 }

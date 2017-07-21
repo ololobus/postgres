@@ -21,6 +21,7 @@
 
 /* CopyStateData is private in commands/copy.c */
 typedef struct CopyStateData *CopyState;
+typedef struct CopyFromStateData *CopyFromState;
 typedef int (*copy_data_source_cb) (void *outbuf, int minread, int maxread);
 
 extern void DoCopy(ParseState *state, const CopyStmt *stmt,
@@ -39,6 +40,7 @@ extern void CopyFromErrorCallback(void *arg);
 
 extern void CopyFromBgwMainLoop(Datum main_arg);
 extern uint64 CopyFrom(CopyState cstate);
+extern uint64 ParallelCopyFrom(CopyState cstate);
 
 extern DestReceiver *CreateCopyDestReceiver(void);
 

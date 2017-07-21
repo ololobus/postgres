@@ -494,7 +494,7 @@ RegisterLWLockTranches(void)
 
 	if (LWLockTrancheArray == NULL)
 	{
-		LWLockTranchesAllocated = 64;
+		LWLockTranchesAllocated = 128;
 		LWLockTrancheArray = (char **)
 			MemoryContextAllocZero(TopMemoryContext,
 								   LWLockTranchesAllocated * sizeof(char *));
@@ -511,6 +511,7 @@ RegisterLWLockTranches(void)
 	LWLockRegisterTranche(LWTRANCHE_PARALLEL_QUERY_DSA,
 						  "parallel_query_dsa");
 	LWLockRegisterTranche(LWTRANCHE_TBM, "tbm");
+    LWLockRegisterTranche(LWTRANCHE_COPY_FROM, "copy_from");
 
 	/* Register named tranches. */
 	for (i = 0; i < NamedLWLockTrancheRequests; i++)
