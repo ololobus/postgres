@@ -414,12 +414,11 @@ static bool CopyGetInt16(CopyState cstate, int16 *val);
 
 
 static ParallelState* shm_mq_setup(int64 queue_size, int32 nworkers, 
-                                   dsm_segment **segp, shm_mq_handle **output,
-                                   shm_mq_handle **input);
+                                   dsm_segment **segp, shm_mq_handle **mq_handles[]);
 static void setup_dynamic_shared_memory(int64 queue_size, int nworkers,
                                         dsm_segment **segp,
-                                        ParallelState **hdrp,
-                                        shm_mq **outp, shm_mq **inp);
+                                        ParallelState **pstp,
+                                        shm_mq **mqs[]);
 static WorkerState *setup_background_workers(int nworkers,
                                              dsm_segment *seg);
 static void cleanup_background_workers(dsm_segment *seg, Datum arg);
@@ -5025,14 +5024,17 @@ CreateCopyDestReceiver(void)
 void
 CopyFromBgwMainLoop(Datum main_arg)
 {
-    volatile ParallelState *hdr;
+    volatile ParallelState *pst;
     dsm_segment     *seg;
     shm_toc         *toc;
-    shm_mq_handle   *inqh;
-    shm_mq_handle   *outqh;
     int              myworkernumber;
     PGPROC          *registrant;
-    int              prev = 0;
+    // int              prev = 0;
+    shm_mq          *mq;
+    shm_mq_handle   *mqh;
+    shm_mq_result    shmq_res;
+    Size             len;
+    void            *data;
 
     /*
      * Establish signal handlers.
@@ -5074,13 +5076,13 @@ CopyFromBgwMainLoop(Datum main_arg)
      * find it.  Our worker number gives our identity: there may be just one
      * worker involved in this parallel operation, or there may be many.
      */
-    hdr = shm_toc_lookup(toc, 0, false);
+    pst = shm_toc_lookup(toc, 0, false);
     LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
     // SpinLockAcquire(&pst->mutex);
-    myworkernumber = ++hdr->workers_attached;
+    myworkernumber = ++pst->workers_attached;
     // SpinLockRelease(&pst->mutex);
     LWLockRelease(CopyFromBgwLock);
-    if (myworkernumber > hdr->workers_total)
+    if (myworkernumber > pst->workers_total)
         ereport(ERROR,
                 (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                  errmsg("too many message queue testing workers already")));
@@ -5088,7 +5090,9 @@ CopyFromBgwMainLoop(Datum main_arg)
     /*
      * Attach to the appropriate message queues.
      */
-    // attach_to_queues(seg, toc, myworkernumber, &inqh, &outqh);
+    mq = shm_toc_lookup(toc, myworkernumber, false);
+    shm_mq_set_receiver(mq, MyProc);
+    mqh = shm_mq_attach(mq, seg, NULL);
 
     /*
      * Indicate that we're fully initialized and ready to begin the main part
@@ -5101,8 +5105,8 @@ CopyFromBgwMainLoop(Datum main_arg)
      */
     LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
     // SpinLockAcquire(&pst->mutex);
-    ++hdr->workers_ready;
-    elog(LOG, "BGWorker #%d started with curr_line=%d", myworkernumber, hdr->curr_line);
+    ++pst->workers_ready;
+    elog(LOG, "BGWorker #%d started", myworkernumber);
     // SpinLockRelease(&pst->mutex);
     LWLockRelease(CopyFromBgwLock);
     registrant = BackendPidGetProc(MyBgworkerEntry->bgw_notify_pid);
@@ -5119,15 +5123,20 @@ CopyFromBgwMainLoop(Datum main_arg)
     {
         CHECK_FOR_INTERRUPTS();
 
-        LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
-        // SpinLockAcquire(&hdr->mutex);
-        if (hdr->curr_line != prev)
-        {
-            elog(LOG, "BGWorker #%d dummy processing line #%d", myworkernumber, hdr->curr_line);
-        }
-        prev = hdr->curr_line;
-        // SpinLockRelease(&hdr->mutex);
-        LWLockRelease(CopyFromBgwLock);
+        // LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
+        // // SpinLockAcquire(&pst->mutex);
+        // if (pst->curr_line != prev)
+        // {
+        //     elog(LOG, "BGWorker #%d dummy processing line #%d", myworkernumber, pst->curr_line);
+        // }
+        // prev = pst->curr_line;
+        // // SpinLockRelease(&pst->mutex);
+        // LWLockRelease(CopyFromBgwLock);
+
+        shmq_res = shm_mq_receive(mqh, &len, &data, false);
+        if (shmq_res != SHM_MQ_SUCCESS)
+            break;
+        elog(LOG, "BGWorker #%d dummy processing line #%ld", myworkernumber, *(int64 *) data);
     }
 
     /*
@@ -5167,27 +5176,31 @@ handle_sigterm(SIGNAL_ARGS)
  */
 static ParallelState*
 shm_mq_setup(int64 queue_size, int32 nworkers, dsm_segment **segp,
-                  shm_mq_handle **output, shm_mq_handle **input)
+                  shm_mq_handle ***mq_handles)
 {
-    dsm_segment *seg;
-    ParallelState *hdr;
-    shm_mq       *outq = NULL;    /* placate compiler */
-    shm_mq       *inq = NULL;        /* placate compiler */
-    WorkerState *wstate;
+    int             i;
+    dsm_segment     *seg;
+    ParallelState   *pst;
+    shm_mq         **mqs;
+    WorkerState     *wstate;
+
+    mqs = palloc0(sizeof(shm_mq *) * nworkers);
 
     /* Set up a dynamic shared memory segment. */
-    setup_dynamic_shared_memory(queue_size, nworkers, &seg, &hdr, &outq, &inq);
+    setup_dynamic_shared_memory(queue_size, nworkers, &seg, &pst, &mqs);
     *segp = seg;
 
     /* Register background workers. */
     wstate = setup_background_workers(nworkers, seg);
 
     /* Attach the queues. */
-    *output = shm_mq_attach(outq, seg, wstate->handle[0]);
-    *input = shm_mq_attach(inq, seg, wstate->handle[nworkers - 1]);
+    for (i = 0; i < nworkers; ++i)
+    {
+        (*mq_handles)[i] = shm_mq_attach(mqs[i], seg, wstate->handle[i]);
+    }
 
     /* Wait for workers to become ready. */
-    wait_for_workers_to_become_ready(wstate, hdr);
+    wait_for_workers_to_become_ready(wstate, pst);
 
     /*
      * Once we reach this point, all workers are ready.  We no longer need to
@@ -5198,7 +5211,7 @@ shm_mq_setup(int64 queue_size, int32 nworkers, dsm_segment **segp,
     //                      PointerGetDatum(wstate));
     // pfree(wstate);
 
-    return hdr;
+    return pst;
 }
 
 /*
@@ -5210,15 +5223,15 @@ shm_mq_setup(int64 queue_size, int32 nworkers, dsm_segment **segp,
  */
 static void
 setup_dynamic_shared_memory(int64 queue_size, int nworkers,
-                            dsm_segment **segp, ParallelState **hdrp,
-                            shm_mq **outp, shm_mq **inp)
+                            dsm_segment **segp, ParallelState **pstp,
+                            shm_mq ***mqs)
 {
     shm_toc_estimator e;
-    int            i;
-    Size        segsize;
-    dsm_segment *seg;
-    shm_toc    *toc;
-    ParallelState *hdr;
+    int               i;
+    Size              segsize;
+    dsm_segment      *seg;
+    shm_toc          *toc;
+    ParallelState    *pst;
 
     /* Ensure a valid queue size. */
     if (queue_size < 0 || ((uint64) queue_size) < shm_mq_minimum_size)
@@ -5244,7 +5257,7 @@ setup_dynamic_shared_memory(int64 queue_size, int nworkers,
     shm_toc_estimate_chunk(&e, sizeof(ParallelState));
     for (i = 0; i <= nworkers; ++i)
         shm_toc_estimate_chunk(&e, (Size) queue_size);
-    shm_toc_estimate_keys(&e, 2 + nworkers);
+    shm_toc_estimate_keys(&e, 1 + nworkers);
     segsize = shm_toc_estimate(&e);
 
     /* Create the shared memory segment and establish a table of contents. */
@@ -5253,39 +5266,28 @@ setup_dynamic_shared_memory(int64 queue_size, int nworkers,
                          segsize);
 
     /* Set up the header region. */
-    hdr = shm_toc_allocate(toc, sizeof(ParallelState));
-    SpinLockInit(&hdr->mutex);
-    hdr->workers_total = nworkers;
-    hdr->workers_attached = 0;
-    hdr->workers_ready = 0;
-    shm_toc_insert(toc, 0, hdr);
+    pst = shm_toc_allocate(toc, sizeof(ParallelState));
+    SpinLockInit(&pst->mutex);
+    pst->workers_total = nworkers;
+    pst->workers_attached = 0;
+    pst->workers_ready = 0;
+    shm_toc_insert(toc, 0, pst);
 
     /* Set up one message queue per worker, plus one. */
-    for (i = 0; i <= nworkers; ++i)
+    for (i = 0; i < nworkers; ++i)
     {
-        shm_mq       *mq;
+        shm_mq *mq;
 
         mq = shm_mq_create(shm_toc_allocate(toc, (Size) queue_size),
                            (Size) queue_size);
         shm_toc_insert(toc, i + 1, mq);
-
-        if (i == 0)
-        {
-            /* We send messages to the first queue. */
-            shm_mq_set_sender(mq, MyProc);
-            *outp = mq;
-        }
-        if (i == nworkers)
-        {
-            /* We receive messages from the last queue. */
-            shm_mq_set_receiver(mq, MyProc);
-            *inp = mq;
-        }
+        shm_mq_set_sender(mq, MyProc);
+        (*mqs)[i] = mq;
     }
 
     /* Return results to caller. */
     *segp = seg;
-    *hdrp = hdr;
+    *pstp = pst;
 }
 
 /*
@@ -5454,11 +5456,17 @@ ParallelCopyFrom(CopyState cstate)
     CopyFromState   cfstate;
     ParallelState  *pst;
     dsm_segment    *seg;
-    shm_mq_handle  *outqh;
-    shm_mq_handle  *inqh;
-    shm_mq_result   res;
-    int64           queue_size = 64;
     int32           nworkers = max_parallel_workers_per_gather;
+    int64           queue_size = 8;
+    shm_mq_handle **mq_handles;
+    shm_mq_result   shmq_res;
+    int             last_worker_used = 0;
+    int64           message = 0;
+    // char           *message_contents = VARDATA_ANY(message);
+    // int             message_size = VARSIZE_ANY_EXHDR(message);
+    int             message_size = sizeof(message);
+
+    mq_handles = palloc0(sizeof(shm_mq_handle *) * nworkers);
 
     cfstate = (CopyFromStateData *) palloc0(sizeof(CopyFromStateData));
 
@@ -5502,7 +5510,7 @@ ParallelCopyFrom(CopyState cstate)
 
 	Assert(cfstate->cstate->rel);
 
-    pst = shm_mq_setup(queue_size, nworkers, &seg, &outqh, &inqh);
+    pst = shm_mq_setup(queue_size * message_size, nworkers, &seg, &mq_handles);
 
 	/*
 	 * The target must be a plain relation or have an INSTEAD OF INSERT row
@@ -5720,6 +5728,17 @@ ParallelCopyFrom(CopyState cstate)
         pst->curr_line++;
         // SpinLockRelease(&pst->mutex);
         LWLockRelease(CopyFromBgwLock);
+
+        if (next_cf_state) {
+            message = pst->curr_line;
+            shmq_res = shm_mq_send(mq_handles[++last_worker_used - 1], message_size, &message, false);
+            if (shmq_res != SHM_MQ_SUCCESS)
+                ereport(ERROR,
+                        (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                         errmsg("could not send message")));
+            if (last_worker_used == nworkers)
+                last_worker_used = 0;
+        }
 
 		if (!next_cf_state) {
 			break;
