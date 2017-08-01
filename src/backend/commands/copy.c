@@ -226,7 +226,7 @@ typedef struct CopyStateData
 
 	/*
 	 * Finally, raw_buf holds raw data read from the data source (file or
-	 * client connection).  CopyReadLine parses this data sufficiently to
+	 * client connection).    parses this data sufficiently to
 	 * locate line boundaries, then transfers the data to line_buf and
 	 * converts it.  Note: we guarantee that there is a \0 at
 	 * raw_buf[raw_buf_len].
@@ -5113,6 +5113,11 @@ CopyFromBgwMainLoop(Datum main_arg)
         msg = (char *) data;
         if (shmq_res != SHM_MQ_SUCCESS)
             break;
+        if (len == 0)
+        {
+            elog(LOG, "BGWorker #%d: got zero-length message, stopping", myworkernumber);
+            break;
+        }
         // elog(LOG, "BGWorker #%d dummy processing line #%ld", myworkernumber, *(int64 *) data);
         elog(LOG, "BGWorker #%d dummy processing line: %s", myworkernumber, msg);
     }
@@ -5185,9 +5190,9 @@ shm_mq_setup(int64 queue_size, int32 nworkers, dsm_segment **segp,
      * kill them if we die; they'll die on their own as the message queues
      * shut down.
      */
-    // cancel_on_dsm_detach(seg, cleanup_background_workers,
-    //                      PointerGetDatum(wstate));
-    // pfree(wstate);
+    cancel_on_dsm_detach(seg, cleanup_background_workers,
+                         PointerGetDatum(wstate));
+    pfree(wstate);
 
     return pst;
 }
@@ -5666,27 +5671,28 @@ ParallelCopyFrom(CopyState cstate)
 
 	for (;;)
 	{
-		TupleTableSlot *slot;
-		bool		skip_tuple;
-		Oid			loaded_oid = InvalidOid;
-        int         next_cf_state; /* NextCopyFrom return state */
+        // TupleTableSlot *slot;
+        // bool        skip_tuple;
+        // Oid            loaded_oid = InvalidOid;
+        //         int         next_cf_state; /* NextCopyFrom return state */
+        bool done;
 
 		CHECK_FOR_INTERRUPTS();
 
-		if (nBufferedTuples == 0)
-		{
-			/*
-			 * Reset the per-tuple exprcontext. We can only do this if the
-			 * tuple buffer is empty. (Calling the context the per-tuple
-			 * memory context is a bit of a misnomer now.)
-			 */
-			ResetPerTupleExprContext(estate);
-		}
+        // if (nBufferedTuples == 0)
+        // {
+        //     /*
+        //      * Reset the per-tuple exprcontext. We can only do this if the
+        //      * tuple buffer is empty. (Calling the context the per-tuple
+        //      * memory context is a bit of a misnomer now.)
+        //      */
+        //     ResetPerTupleExprContext(estate);
+        // }
 
 		/* Switch into its memory context */
-		MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+        // MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
-        next_cf_state = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+        // next_cf_state = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
 
 
         // LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
@@ -5695,15 +5701,52 @@ ParallelCopyFrom(CopyState cstate)
         // // SpinLockRelease(&pst->mutex);
         // LWLockRelease(CopyFromBgwLock);
 
-        if (next_cf_state) {
+    	/* on input just throw the header line away */
+    	if (cstate->cur_lineno == 0 && cstate->header_line)
+    	{
+    		cstate->cur_lineno++;
+    		if (CopyReadLine(cstate))
+    			continue;		/* done */
+    	}
+
+    	cstate->cur_lineno++;
+
+    	/* Actually read the line into memory here */
+    	done = CopyReadLine(cstate);
+        // elog(LOG, "Reading line #%d with status %d", cstate->cur_lineno, done);
+
+    	/*
+    	 * EOF at start of line means we're done.  If we see EOF after some
+    	 * characters, we act as though it was newline followed by EOF, ie,
+    	 * process the line and then exit loop on next iteration.
+    	 */
+        if (done && cstate->line_buf.len == 0)
+        {
+            int i;
+
+            elog(LOG, "EOF reached, ending up queries");
+            for (i = 0; i < nworkers; i++)
+            {
+                /*
+                 * Sending zero-length data to workers in order to stop them.
+                 */
+                shm_mq_send(mq_handles[i], 0, cstate->line_buf.data, false);
+            }
+
+            break;
+        }
+        else
+        {
             // message = pst->curr_line;
             // cur_ptr = cstate->line_buf.data;
             // line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
-    		message = (char *) palloc(cstate->line_buf.len);
-    		memcpy(message, cstate->line_buf.data, cstate->line_buf.len);
+            // message = (char *) palloc(cstate->line_buf.len);
+            // memcpy(message, cstate->line_buf.data, cstate->line_buf.len);
             // shmq_res = shm_mq_send(mq_handles[++last_worker_used - 1], message_size, &message, false);
-            elog(LOG, "Sending line #%d '%s' to BGWorker #%d", cstate->cur_lineno, message, last_worker_used + 1);
-            shmq_res = shm_mq_send(mq_handles[++last_worker_used - 1], cstate->line_buf.len, message, false);
+            // elog(LOG, "Sending line #%d '%s' to BGWorker #%d", cstate->cur_lineno, message, last_worker_used + 1);
+            elog(LOG, "Sending line #%d to BGWorker #%d", cstate->cur_lineno, last_worker_used + 1);
+            // shmq_res = shm_mq_send(mq_handles[++last_worker_used - 1], cstate->line_buf.len, message, false);
+            shmq_res = shm_mq_send(mq_handles[++last_worker_used - 1], cstate->line_buf.len, cstate->line_buf.data, false);
             if (shmq_res != SHM_MQ_SUCCESS)
                 ereport(ERROR,
                         (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -5712,258 +5755,258 @@ ParallelCopyFrom(CopyState cstate)
                 last_worker_used = 0;
         }
 
-		if (!next_cf_state) {
-			break;
-		}
-        else if (next_cf_state == NCF_SUCCESS)
-        {
-    		/* And now we can form the input tuple. */
-    		tuple = heap_form_tuple(tupDesc, values, nulls);
-
-    		if (loaded_oid != InvalidOid)
-    			HeapTupleSetOid(tuple, loaded_oid);
-
-    		/*
-    		 * Constraints might reference the tableoid column, so initialize
-    		 * t_tableOid before evaluating them.
-    		 */
-    		tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-
-    		/* Triggers and stuff need to be invoked in query context. */
-    		MemoryContextSwitchTo(oldcontext);
-
-    		/* Place tuple in tuple slot --- but slot shouldn't free it */
-    		slot = myslot;
-    		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-
-    		/* Determine the partition to heap_insert the tuple into */
-    		if (cstate->partition_dispatch_info)
-    		{
-    			int			leaf_part_index;
-    			TupleConversionMap *map;
-
-    			/*
-    			 * Away we go ... If we end up not finding a partition after all,
-    			 * ExecFindPartition() does not return and errors out instead.
-    			 * Otherwise, the returned value is to be used as an index into
-    			 * arrays mt_partitions[] and mt_partition_tupconv_maps[] that
-    			 * will get us the ResultRelInfo and TupleConversionMap for the
-    			 * partition, respectively.
-    			 */
-    			leaf_part_index = ExecFindPartition(resultRelInfo,
-    												cstate->partition_dispatch_info,
-    												slot,
-    												estate);
-    			Assert(leaf_part_index >= 0 &&
-    				   leaf_part_index < cstate->num_partitions);
-
-    			/*
-    			 * If this tuple is mapped to a partition that is not same as the
-    			 * previous one, we'd better make the bulk insert mechanism gets a
-    			 * new buffer.
-    			 */
-    			if (prev_leaf_part_index != leaf_part_index)
-    			{
-    				ReleaseBulkInsertStatePin(bistate);
-    				prev_leaf_part_index = leaf_part_index;
-    			}
-
-    			/*
-    			 * Save the old ResultRelInfo and switch to the one corresponding
-    			 * to the selected partition.
-    			 */
-    			saved_resultRelInfo = resultRelInfo;
-    			resultRelInfo = cstate->partitions + leaf_part_index;
-
-    			/* We do not yet have a way to insert into a foreign partition */
-    			if (resultRelInfo->ri_FdwRoutine)
-    				ereport(ERROR,
-    						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-    						 errmsg("cannot route inserted tuples to a foreign table")));
-
-    			/*
-    			 * For ExecInsertIndexTuples() to work on the partition's indexes
-    			 */
-    			estate->es_result_relation_info = resultRelInfo;
-
-    			/*
-    			 * If we're capturing transition tuples, we might need to convert
-    			 * from the partition rowtype to parent rowtype.
-    			 */
-    			if (cstate->transition_capture != NULL)
-    			{
-    				if (resultRelInfo->ri_TrigDesc &&
-    					(resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
-    					 resultRelInfo->ri_TrigDesc->trig_insert_instead_row))
-    				{
-    					/*
-    					 * If there are any BEFORE or INSTEAD triggers on the
-    					 * partition, we'll have to be ready to convert their
-    					 * result back to tuplestore format.
-    					 */
-    					cstate->transition_capture->tcs_original_insert_tuple = NULL;
-    					cstate->transition_capture->tcs_map =
-    						cstate->transition_tupconv_maps[leaf_part_index];
-    				}
-    				else
-    				{
-    					/*
-    					 * Otherwise, just remember the original unconverted
-    					 * tuple, to avoid a needless round trip conversion.
-    					 */
-    					cstate->transition_capture->tcs_original_insert_tuple = tuple;
-    					cstate->transition_capture->tcs_map = NULL;
-    				}
-    			}
-    			/*
-    			 * We might need to convert from the parent rowtype to the
-    			 * partition rowtype.
-    			 */
-    			map = cstate->partition_tupconv_maps[leaf_part_index];
-    			if (map)
-    			{
-    				Relation	partrel = resultRelInfo->ri_RelationDesc;
-
-    				tuple = do_convert_tuple(tuple, map);
-
-    				/*
-    				 * We must use the partition's tuple descriptor from this
-    				 * point on.  Use a dedicated slot from this point on until
-    				 * we're finished dealing with the partition.
-    				 */
-    				slot = cstate->partition_tuple_slot;
-    				Assert(slot != NULL);
-    				ExecSetSlotDescriptor(slot, RelationGetDescr(partrel));
-    				ExecStoreTuple(tuple, slot, InvalidBuffer, true);
-    			}
-
-    			tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-    		}
-
-    		skip_tuple = false;
-
-    		/* BEFORE ROW INSERT Triggers */
-    		if (resultRelInfo->ri_TrigDesc &&
-    			resultRelInfo->ri_TrigDesc->trig_insert_before_row)
-    		{
-    			slot = ExecBRInsertTriggers(estate, resultRelInfo, slot);
-
-    			if (slot == NULL)	/* "do nothing" */
-    				skip_tuple = true;
-    			else				/* trigger might have changed tuple */
-    				tuple = ExecMaterializeSlot(slot);
-    		}
-        }
-        else
-        {
-            skip_tuple = true;
-        }
-
-		if (!skip_tuple)
-		{
-			if (resultRelInfo->ri_TrigDesc &&
-				resultRelInfo->ri_TrigDesc->trig_insert_instead_row)
-			{
-				/* Pass the data to the INSTEAD ROW INSERT trigger */
-				ExecIRInsertTriggers(estate, resultRelInfo, slot);
-			}
-			else
-			{
-				/*
-				 * We always check the partition constraint, including when
-				 * the tuple got here via tuple-routing.  However we don't
-				 * need to in the latter case if no BR trigger is defined on
-				 * the partition.  Note that a BR trigger might modify the
-				 * tuple such that the partition constraint is no longer
-				 * satisfied, so we need to check in that case.
-				 */
-				bool		check_partition_constr =
-				(resultRelInfo->ri_PartitionCheck != NIL);
-
-				if (saved_resultRelInfo != NULL &&
-					!(resultRelInfo->ri_TrigDesc &&
-					  resultRelInfo->ri_TrigDesc->trig_insert_before_row))
-					check_partition_constr = false;
-
-				/* Check the constraints of the tuple */
-				if (cstate->rel->rd_att->constr || check_partition_constr)
-					ExecConstraints(resultRelInfo, slot, estate);
-
-				if (useHeapMultiInsert)
-				{
-					/* Add this tuple to the tuple buffer */
-					if (nBufferedTuples == 0)
-						firstBufferedLineNo = cstate->cur_lineno;
-					bufferedTuples[nBufferedTuples++] = tuple;
-					bufferedTuplesSize += tuple->t_len;
-
-					/*
-					 * If the buffer filled up, flush it.  Also flush if the
-					 * total size of all the tuples in the buffer becomes
-					 * large, to avoid using large amounts of memory for the
-					 * buffer when the tuples are exceptionally wide.
-					 */
-					if (nBufferedTuples == MAX_BUFFERED_TUPLES ||
-						bufferedTuplesSize > 65535)
-					{
-						CopyFromInsertBatch(cstate, estate, mycid, hi_options,
-											resultRelInfo, myslot, bistate,
-											nBufferedTuples, bufferedTuples,
-											firstBufferedLineNo);
-						nBufferedTuples = 0;
-						bufferedTuplesSize = 0;
-					}
-				}
-				else
-				{
-					List	   *recheckIndexes = NIL;
-
-					/* OK, store the tuple and create index entries for it */
-					heap_insert(resultRelInfo->ri_RelationDesc, tuple, mycid,
-								hi_options, bistate);
-
-					if (resultRelInfo->ri_NumIndices > 0)
-						recheckIndexes = ExecInsertIndexTuples(slot,
-															   &(tuple->t_self),
-															   estate,
-															   false,
-															   NULL,
-															   NIL);
-
-					/* AFTER ROW INSERT Triggers */
-					ExecARInsertTriggers(estate, resultRelInfo, tuple,
-										 recheckIndexes, cstate->transition_capture);
-
-					list_free(recheckIndexes);
-				}
-			}
-
-			/*
-			 * We count only tuples not suppressed by a BEFORE INSERT trigger;
-			 * this is the same definition used by execMain.c for counting
-			 * tuples inserted by an INSERT command.
-			 */
-			processed++;
-
-			if (saved_resultRelInfo)
-			{
-				resultRelInfo = saved_resultRelInfo;
-				estate->es_result_relation_info = resultRelInfo;
-			}
-		}
-	}
-
-	/* Flush any remaining buffered tuples */
-	if (nBufferedTuples > 0)
-		CopyFromInsertBatch(cstate, estate, mycid, hi_options,
-							resultRelInfo, myslot, bistate,
-							nBufferedTuples, bufferedTuples,
-							firstBufferedLineNo);
-
-	/* Done, clean up */
-	error_context_stack = errcallback.previous;
-
-	FreeBulkInsertState(bistate);
+    //     if (!next_cf_state) {
+    //         break;
+    //     }
+    //         else if (next_cf_state == NCF_SUCCESS)
+    //         {
+    //             /* And now we can form the input tuple. */
+    //             tuple = heap_form_tuple(tupDesc, values, nulls);
+    //
+    //             if (loaded_oid != InvalidOid)
+    //                 HeapTupleSetOid(tuple, loaded_oid);
+    //
+    //             /*
+    //              * Constraints might reference the tableoid column, so initialize
+    //              * t_tableOid before evaluating them.
+    //              */
+    //             tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+    //
+    //             /* Triggers and stuff need to be invoked in query context. */
+    //             MemoryContextSwitchTo(oldcontext);
+    //
+    //             /* Place tuple in tuple slot --- but slot shouldn't free it */
+    //             slot = myslot;
+    //             ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+    //
+    //             /* Determine the partition to heap_insert the tuple into */
+    //             if (cstate->partition_dispatch_info)
+    //             {
+    //                 int            leaf_part_index;
+    //                 TupleConversionMap *map;
+    //
+    //                 /*
+    //                  * Away we go ... If we end up not finding a partition after all,
+    //                  * ExecFindPartition() does not return and errors out instead.
+    //                  * Otherwise, the returned value is to be used as an index into
+    //                  * arrays mt_partitions[] and mt_partition_tupconv_maps[] that
+    //                  * will get us the ResultRelInfo and TupleConversionMap for the
+    //                  * partition, respectively.
+    //                  */
+    //                 leaf_part_index = ExecFindPartition(resultRelInfo,
+    //                                                     cstate->partition_dispatch_info,
+    //                                                     slot,
+    //                                                     estate);
+    //                 Assert(leaf_part_index >= 0 &&
+    //                        leaf_part_index < cstate->num_partitions);
+    //
+    //                 /*
+    //                  * If this tuple is mapped to a partition that is not same as the
+    //                  * previous one, we'd better make the bulk insert mechanism gets a
+    //                  * new buffer.
+    //                  */
+    //                 if (prev_leaf_part_index != leaf_part_index)
+    //                 {
+    //                     ReleaseBulkInsertStatePin(bistate);
+    //                     prev_leaf_part_index = leaf_part_index;
+    //                 }
+    //
+    //                 /*
+    //                  * Save the old ResultRelInfo and switch to the one corresponding
+    //                  * to the selected partition.
+    //                  */
+    //                 saved_resultRelInfo = resultRelInfo;
+    //                 resultRelInfo = cstate->partitions + leaf_part_index;
+    //
+    //                 /* We do not yet have a way to insert into a foreign partition */
+    //                 if (resultRelInfo->ri_FdwRoutine)
+    //                     ereport(ERROR,
+    //                             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+    //                              errmsg("cannot route inserted tuples to a foreign table")));
+    //
+    //                 /*
+    //                  * For ExecInsertIndexTuples() to work on the partition's indexes
+    //                  */
+    //                 estate->es_result_relation_info = resultRelInfo;
+    //
+    //                 /*
+    //                  * If we're capturing transition tuples, we might need to convert
+    //                  * from the partition rowtype to parent rowtype.
+    //                  */
+    //                 if (cstate->transition_capture != NULL)
+    //                 {
+    //                     if (resultRelInfo->ri_TrigDesc &&
+    //                         (resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
+    //                          resultRelInfo->ri_TrigDesc->trig_insert_instead_row))
+    //                     {
+    //                         /*
+    //                          * If there are any BEFORE or INSTEAD triggers on the
+    //                          * partition, we'll have to be ready to convert their
+    //                          * result back to tuplestore format.
+    //                          */
+    //                         cstate->transition_capture->tcs_original_insert_tuple = NULL;
+    //                         cstate->transition_capture->tcs_map =
+    //                             cstate->transition_tupconv_maps[leaf_part_index];
+    //                     }
+    //                     else
+    //                     {
+    //                         /*
+    //                          * Otherwise, just remember the original unconverted
+    //                          * tuple, to avoid a needless round trip conversion.
+    //                          */
+    //                         cstate->transition_capture->tcs_original_insert_tuple = tuple;
+    //                         cstate->transition_capture->tcs_map = NULL;
+    //                     }
+    //                 }
+    //                 /*
+    //                  * We might need to convert from the parent rowtype to the
+    //                  * partition rowtype.
+    //                  */
+    //                 map = cstate->partition_tupconv_maps[leaf_part_index];
+    //                 if (map)
+    //                 {
+    //                     Relation    partrel = resultRelInfo->ri_RelationDesc;
+    //
+    //                     tuple = do_convert_tuple(tuple, map);
+    //
+    //                     /*
+    //                      * We must use the partition's tuple descriptor from this
+    //                      * point on.  Use a dedicated slot from this point on until
+    //                      * we're finished dealing with the partition.
+    //                      */
+    //                     slot = cstate->partition_tuple_slot;
+    //                     Assert(slot != NULL);
+    //                     ExecSetSlotDescriptor(slot, RelationGetDescr(partrel));
+    //                     ExecStoreTuple(tuple, slot, InvalidBuffer, true);
+    //                 }
+    //
+    //                 tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+    //             }
+    //
+    //             skip_tuple = false;
+    //
+    //             /* BEFORE ROW INSERT Triggers */
+    //             if (resultRelInfo->ri_TrigDesc &&
+    //                 resultRelInfo->ri_TrigDesc->trig_insert_before_row)
+    //             {
+    //                 slot = ExecBRInsertTriggers(estate, resultRelInfo, slot);
+    //
+    //                 if (slot == NULL)    /* "do nothing" */
+    //                     skip_tuple = true;
+    //                 else                /* trigger might have changed tuple */
+    //                     tuple = ExecMaterializeSlot(slot);
+    //             }
+    //         }
+    //         else
+    //         {
+    //             skip_tuple = true;
+    //         }
+    //
+    //     if (!skip_tuple)
+    //     {
+    //         if (resultRelInfo->ri_TrigDesc &&
+    //             resultRelInfo->ri_TrigDesc->trig_insert_instead_row)
+    //         {
+    //             /* Pass the data to the INSTEAD ROW INSERT trigger */
+    //             ExecIRInsertTriggers(estate, resultRelInfo, slot);
+    //         }
+    //         else
+    //         {
+    //             /*
+    //              * We always check the partition constraint, including when
+    //              * the tuple got here via tuple-routing.  However we don't
+    //              * need to in the latter case if no BR trigger is defined on
+    //              * the partition.  Note that a BR trigger might modify the
+    //              * tuple such that the partition constraint is no longer
+    //              * satisfied, so we need to check in that case.
+    //              */
+    //             bool        check_partition_constr =
+    //             (resultRelInfo->ri_PartitionCheck != NIL);
+    //
+    //             if (saved_resultRelInfo != NULL &&
+    //                 !(resultRelInfo->ri_TrigDesc &&
+    //                   resultRelInfo->ri_TrigDesc->trig_insert_before_row))
+    //                 check_partition_constr = false;
+    //
+    //             /* Check the constraints of the tuple */
+    //             if (cstate->rel->rd_att->constr || check_partition_constr)
+    //                 ExecConstraints(resultRelInfo, slot, estate);
+    //
+    //             if (useHeapMultiInsert)
+    //             {
+    //                 /* Add this tuple to the tuple buffer */
+    //                 if (nBufferedTuples == 0)
+    //                     firstBufferedLineNo = cstate->cur_lineno;
+    //                 bufferedTuples[nBufferedTuples++] = tuple;
+    //                 bufferedTuplesSize += tuple->t_len;
+    //
+    //                 /*
+    //                  * If the buffer filled up, flush it.  Also flush if the
+    //                  * total size of all the tuples in the buffer becomes
+    //                  * large, to avoid using large amounts of memory for the
+    //                  * buffer when the tuples are exceptionally wide.
+    //                  */
+    //                 if (nBufferedTuples == MAX_BUFFERED_TUPLES ||
+    //                     bufferedTuplesSize > 65535)
+    //                 {
+    //                     CopyFromInsertBatch(cstate, estate, mycid, hi_options,
+    //                                         resultRelInfo, myslot, bistate,
+    //                                         nBufferedTuples, bufferedTuples,
+    //                                         firstBufferedLineNo);
+    //                     nBufferedTuples = 0;
+    //                     bufferedTuplesSize = 0;
+    //                 }
+    //             }
+    //             else
+    //             {
+    //                 List       *recheckIndexes = NIL;
+    //
+    //                 /* OK, store the tuple and create index entries for it */
+    //                 heap_insert(resultRelInfo->ri_RelationDesc, tuple, mycid,
+    //                             hi_options, bistate);
+    //
+    //                 if (resultRelInfo->ri_NumIndices > 0)
+    //                     recheckIndexes = ExecInsertIndexTuples(slot,
+    //                                                            &(tuple->t_self),
+    //                                                            estate,
+    //                                                            false,
+    //                                                            NULL,
+    //                                                            NIL);
+    //
+    //                 /* AFTER ROW INSERT Triggers */
+    //                 ExecARInsertTriggers(estate, resultRelInfo, tuple,
+    //                                      recheckIndexes, cstate->transition_capture);
+    //
+    //                 list_free(recheckIndexes);
+    //             }
+    //         }
+    //
+    //         /*
+    //          * We count only tuples not suppressed by a BEFORE INSERT trigger;
+    //          * this is the same definition used by execMain.c for counting
+    //          * tuples inserted by an INSERT command.
+    //          */
+    //         processed++;
+    //
+    //         if (saved_resultRelInfo)
+    //         {
+    //             resultRelInfo = saved_resultRelInfo;
+    //             estate->es_result_relation_info = resultRelInfo;
+    //         }
+    //     }
+    }
+    //
+    // /* Flush any remaining buffered tuples */
+    // if (nBufferedTuples > 0)
+    //     CopyFromInsertBatch(cstate, estate, mycid, hi_options,
+    //                         resultRelInfo, myslot, bistate,
+    //                         nBufferedTuples, bufferedTuples,
+    //                         firstBufferedLineNo);
+    //
+    // /* Done, clean up */
+    // error_context_stack = errcallback.previous;
+    //
+    // FreeBulkInsertState(bistate);
 
 	MemoryContextSwitchTo(oldcontext);
 
