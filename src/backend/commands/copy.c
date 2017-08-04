@@ -260,8 +260,10 @@ typedef struct
     int workers_total;
     int workers_attached;
     int workers_ready;
+    int workers_finished;
     Oid database_id;
     Oid authenticated_user_id;
+    ConditionVariable cv;
 } ParallelState;
 
 // TODO Consider change
@@ -5008,6 +5010,7 @@ CopyFromBgwMainLoop(Datum main_arg)
     shm_mq_result    shmq_res;
     Size             len;
     void            *data;
+    ConditionVariable cv;
 
     /*
      * Establish signal handlers.
@@ -5089,6 +5092,7 @@ CopyFromBgwMainLoop(Datum main_arg)
     LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
     // SpinLockAcquire(&pst->mutex);
     ++pst->workers_ready;
+    cv = pst->cv;
     elog(LOG, "BGWorker #%d started", myworkernumber);
     // SpinLockRelease(&pst->mutex);
     LWLockRelease(CopyFromBgwLock);
@@ -5121,6 +5125,13 @@ CopyFromBgwMainLoop(Datum main_arg)
         // elog(LOG, "BGWorker #%d dummy processing line #%ld", myworkernumber, *(int64 *) data);
         elog(LOG, "BGWorker #%d dummy processing line: %s", myworkernumber, msg);
     }
+
+    LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
+    ++pst->workers_finished;
+    LWLockRelease(CopyFromBgwLock);
+
+    /* Signal main process that we are done. */
+    ConditionVariableBroadcast(&cv);
 
     /*
      * We're done.  Explicitly detach the shared memory segment so that we
@@ -5250,12 +5261,14 @@ setup_dynamic_shared_memory(int64 queue_size, int nworkers,
 
     /* Set up the header region. */
     pst = shm_toc_allocate(toc, sizeof(ParallelState));
-    SpinLockInit(&pst->mutex);
+    // SpinLockInit(&pst->mutex);
     pst->workers_total = nworkers;
     pst->workers_attached = 0;
     pst->workers_ready = 0;
+    pst->workers_finished = 0;
     pst->database_id = MyDatabaseId;
     pst->authenticated_user_id = GetAuthenticatedUserId();
+    ConditionVariableInit(&pst->cv);
     shm_toc_insert(toc, 0, pst);
 
     /* Set up one message queue per worker, plus one. */
@@ -5431,6 +5444,38 @@ check_worker_status(WorkerState *wstate)
     return true;
 }
 
+static void
+wait_for_workers_to_finish(volatile ParallelState *pst)
+{
+    elog(LOG, "Waiting for BGWorkers to finish");
+
+    for (;;)
+    {
+        int workers_finished;
+        int workers_total;
+        ConditionVariable cv;
+        LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
+        workers_finished = pst->workers_finished;
+        workers_total = pst->workers_total;
+        cv = pst->cv;
+        LWLockRelease(CopyFromBgwLock);
+
+        elog(LOG, "Checking BGWorkers workers_finished: %d, workers_total: %d", workers_finished, workers_total);
+        if (workers_finished == workers_total)
+        {
+            break;
+        }
+
+        elog(LOG, "Going to sleep again");
+        /* Wait for the workers to wake us up. */
+        ConditionVariableSleep(&cv, WAIT_EVENT_COPY_FROM_BGWORKERS_FINISHED);
+
+        /* An interrupt may have occurred while we were waiting. */
+        CHECK_FOR_INTERRUPTS();
+    }
+
+    ConditionVariableCancelSleep();
+}
 
 /*
  * Parallel Copy FROM file to relation.
@@ -6007,6 +6052,9 @@ ParallelCopyFrom(CopyState cstate)
     // error_context_stack = errcallback.previous;
     //
     // FreeBulkInsertState(bistate);
+
+    /* Wait for all workers to complete their work. */
+    wait_for_workers_to_finish(pst);
 
 	MemoryContextSwitchTo(oldcontext);
 
