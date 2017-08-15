@@ -40,7 +40,12 @@ extern void CopyFromErrorCallback(void *arg);
 
 extern void CopyFromBgwMainLoop(Datum main_arg);
 extern uint64 CopyFrom(CopyState cstate);
-extern uint64 ParallelCopyFrom(CopyState cstate);
+extern uint64 ParallelCopyFrom(CopyState cstate, ParseState *pstate,
+			  Relation rel,
+			  const char *filename,
+			  bool is_program,
+			  List *attnamelist,
+			  List *options);
 
 extern DestReceiver *CreateCopyDestReceiver(void);
 
