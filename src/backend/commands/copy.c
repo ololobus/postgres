@@ -257,8 +257,8 @@ typedef struct
 
 typedef struct
 {
-    slock_t mutex;
-    int curr_line;
+    // slock_t mutex;
+    uint64 processed;
     int workers_total;
     int workers_attached;
     int workers_ready;
@@ -266,21 +266,6 @@ typedef struct
     Oid database_id;
     Oid authenticated_user_id;
     ConditionVariable cv;
-
-    bool     is_program;
-    Relation rel;
-
-	TupleDesc       tupDesc;
-	ResultRelInfo  *resultRelInfo;
-	EState         *estate;
-	ExprContext    *econtext;
-	TupleTableSlot *myslot;
-
-	ErrorContextCallback errcallback;
-	CommandId	mycid;
-	int			hi_options;
-	BulkInsertState bistate;
-	bool		useHeapMultiInsert;
 } ParallelState;
 
 // TODO Consider change
@@ -3341,26 +3326,29 @@ NextCopyFromRawFields(CopyState cstate, char ***fields, int *nfields)
 	/* only available for text or csv input */
 	Assert(!cstate->binary);
 
-	/* on input just throw the header line away */
-	if (cstate->cur_lineno == 0 && cstate->header_line)
-	{
-		cstate->cur_lineno++;
-		if (CopyReadLine(cstate))
-			return false;		/* done */
-	}
+    if (!IsBackgroundWorker)
+    {
+    	/* on input just throw the header line away */
+    	if (cstate->cur_lineno == 0 && cstate->header_line)
+    	{
+    		cstate->cur_lineno++;
+    		if (CopyReadLine(cstate))
+    			return false;		/* done */
+    	}
 
-	cstate->cur_lineno++;
+    	cstate->cur_lineno++;
 
-	/* Actually read the line into memory here */
-	done = CopyReadLine(cstate);
+    	/* Actually read the line into memory here */
+    	done = CopyReadLine(cstate);
 
-	/*
-	 * EOF at start of line means we're done.  If we see EOF after some
-	 * characters, we act as though it was newline followed by EOF, ie,
-	 * process the line and then exit loop on next iteration.
-	 */
-	if (done && cstate->line_buf.len == 0)
-		return false;
+    	/*
+    	 * EOF at start of line means we're done.  If we see EOF after some
+    	 * characters, we act as though it was newline followed by EOF, ie,
+    	 * process the line and then exit loop on next iteration.
+    	 */
+    	if (done && cstate->line_buf.len == 0)
+    		return false;
+    }
 
 	/* Parse the line into de-escaped field values */
 	if (cstate->csv_mode)
@@ -5029,7 +5017,6 @@ void
 CopyFromBgwMainLoop(Datum main_arg)
 {
     volatile ParallelState *pst;
-    // volatile CopyState      cst;
 
     dsm_segment     *seg;
     shm_toc         *toc;
@@ -5044,20 +5031,42 @@ CopyFromBgwMainLoop(Datum main_arg)
 
     HeapTuple    tuple;
     Datum       *values;
-    bool       *nulls;
+    bool        *nulls;
     MemoryContext oldcontext = CurrentMemoryContext;
 
-	int			prev_leaf_part_index = -1;
-	ResultRelInfo *saved_resultRelInfo = NULL;
+    int            prev_leaf_part_index = -1;
+    ResultRelInfo *saved_resultRelInfo = NULL;
 
-	BulkInsertState bistate;
-	uint64		processed = 0;
-	int			nBufferedTuples = 0;
+    uint64          processed = 0;
+    int             nBufferedTuples = 0;
 
 #define MAX_BUFFERED_TUPLES 1000
     HeapTuple  *bufferedTuples = NULL;    /* initialize to silence warning */
     Size        bufferedTuplesSize = 0;
     int         firstBufferedLineNo = 0;
+
+    TupleDesc       tupDesc;
+    ResultRelInfo  *resultRelInfo;
+    EState         *estate;
+    ExprContext    *econtext;
+    TupleTableSlot *myslot;
+
+    ErrorContextCallback errcallback;
+    CommandId       mycid;
+    int             hi_options;
+    BulkInsertState bistate;
+    bool            useHeapMultiInsert;
+
+    char        *query_string;
+    List	    *parsetree_list;
+    RawStmt     *parsetree;
+	List	    *querytree_list;
+    List	    *plantree_list;
+    PlannedStmt *pstmt;
+    CopyStmt    *cstmnt;
+    ParseState  *pstate;
+    CopyState    cstate;
+    Relation	 rel;
 
     /*
      * Establish signal handlers.
@@ -5079,7 +5088,7 @@ CopyFromBgwMainLoop(Datum main_arg)
      * of contents so we can locate the various data structures we'll need to
      * find within the segment.
      */
-    CurrentResourceOwner = ResourceOwnerCreate(NULL, "test_shm_mq worker");
+    CurrentResourceOwner = ResourceOwnerCreate(NULL, "COPY FROM worker");
     seg = dsm_attach(DatumGetInt32(main_arg));
     if (seg == NULL)
         ereport(ERROR,
@@ -5113,24 +5122,9 @@ CopyFromBgwMainLoop(Datum main_arg)
     /*
      * Attach to the appropriate message queues.
      */
-    mq = shm_toc_lookup(toc, 3 + myworkernumber, false);
+    mq = shm_toc_lookup(toc, 1 + myworkernumber, false);
     shm_mq_set_receiver(mq, MyProc);
     mqh = shm_mq_attach(mq, seg, NULL);
-
-    // void *pt;
-    // pt = shm_toc_lookup(toc, 100500, false);
-    // int i;
-    // // iiiissssssss
-    // i = *(int *) pt;
-    // char *s;
-    // s = (char *) pt + sizeof(int);
-    //
-    //
-    // void *ptp;
-    //
-    // ptp = palloc(sizeof(int) + strlen(s));
-    // *ptp = i;
-
 
     /* Restore database connection. */
     BackgroundWorkerInitializeConnectionByOid(pst->database_id,
@@ -5141,6 +5135,23 @@ CopyFromBgwMainLoop(Datum main_arg)
      * the leader will expect.
      */
     SetClientEncoding(GetDatabaseEncoding());
+
+    query_string = shm_toc_lookup(toc, 1, false);
+
+    elog(LOG, "BGWorker copying from query:\n %s", query_string);
+    parsetree_list = pg_parse_query(query_string);
+    parsetree = lfirst_node(RawStmt, list_head(parsetree_list));
+	querytree_list = pg_analyze_and_rewrite(parsetree, query_string,
+											NULL, 0, NULL);
+	plantree_list = pg_plan_queries(querytree_list,
+									CURSOR_OPT_PARALLEL_OK, NULL);
+    pstmt = lfirst_node(PlannedStmt, list_head(plantree_list));
+    cstmnt = (CopyStmt *) pstmt->utilityStmt;
+
+    elog(LOG, "BGWorker #%d filename from CopyStmt: %s", myworkernumber, cstmnt->filename);
+
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = query_string;
 
     /*
      * Indicate that we're fully initialized and ready to begin the main part
@@ -5155,59 +5166,233 @@ CopyFromBgwMainLoop(Datum main_arg)
     // SpinLockAcquire(&pst->mutex);
     ++pst->workers_ready;
     cv = pst->cv;
-    elog(LOG, "BGWorker #%d started", myworkernumber);
-    // SpinLockRelease(&pst->mutex);
+    // if (pst->workers_ready == pst->workers_total)
+    // {
+    //     registrant = BackendPidGetProc(MyBgworkerEntry->bgw_notify_pid);
+    //     if (registrant == NULL)
+    //     {
+    //         elog(DEBUG1, "registrant backend has exited prematurely");
+    //         proc_exit(1);
+    //     }
+    //     SetLatch(&registrant->procLatch);
+    // }
+    // elog(LOG, "BGWorker #%d started", myworkernumber);
+    // // SpinLockRelease(&pst->mutex);
     LWLockRelease(CopyFromBgwLock);
+
     registrant = BackendPidGetProc(MyBgworkerEntry->bgw_notify_pid);
-    if (registrant == NULL)
-    {
-        elog(DEBUG1, "registrant backend has exited prematurely");
-        proc_exit(1);
-    }
     SetLatch(&registrant->procLatch);
-
-    /* Do the work. */
-	values = (Datum *) palloc(pst->tupDesc->natts * sizeof(Datum));
-	nulls = (bool *) palloc(pst->tupDesc->natts * sizeof(bool));
-
-    volatile char *filename = shm_toc_lookup(toc, 2, false);
-    char *query_string;
-    query_string = filename;
-
-    elog(LOG, "BGWorker copying from query:\n %s", query_string);
-    // raw_parser_result = raw_parser(filename);
-    List	   *parsetree_list = pg_parse_query(query_string);
-    RawStmt    *parsetree = lfirst_node(RawStmt, list_head(parsetree_list));
-	List	   *querytree_list = pg_analyze_and_rewrite(parsetree, query_string,
-											NULL, 0, NULL);
-	List	   *plantree_list = pg_plan_queries(querytree_list,
-									CURSOR_OPT_PARALLEL_OK, NULL);
-    PlannedStmt *pstmt = lfirst_node(PlannedStmt, list_head(plantree_list));
-    // Node       *parsetree = pstmt->utilityStmt;
-    // elog(LOG, "BGWorker parse tree length: %d", raw_parser_result->length);
-    // PlannedStmt *pstmt = linitial_node(PlannedStmt, raw_parser_result);
-    CopyStmt *cstmnt = (CopyStmt *) pstmt->utilityStmt;
-
-    elog(LOG, "BGWorker filename from CopyStmt: %s", cstmnt->filename);
-    // elog(LOG, "BGWorker copying: %d %d %d", cst->binary, cst->ignore_errors, cst->csv_mode);
-
-	ParseState *pstate;
-	pstate = make_parsestate(NULL);
-	pstate->p_sourcetext = query_string;
 
     StartTransactionCommand();
 
-    Relation	rel;
     /* Open and lock the relation, using the appropriate lock type. */
 	rel = heap_openrv(cstmnt->relation, RowExclusiveLock);
                       // (is_from ? RowExclusiveLock : AccessShareLock));
 
-    CopyState cstate = BeginCopyFrom(pstate, rel, cstmnt->filename, cstmnt->is_program,
+    cstate = BeginCopyFrom(pstate, rel, cstmnt->filename, cstmnt->is_program,
 							   NULL, cstmnt->attlist, cstmnt->options);
+
+    estate = CreateExecutorState(); /* for ExecConstraints() */
+    mycid = GetCurrentCommandId(true);
+    hi_options = 0; /* start with default heap_insert options */
+
+    /*
+     * The target must be a plain relation or have an INSTEAD OF INSERT row
+     * trigger.  (Currently, such triggers are only allowed on views, so we
+     * only hint about them in the view case.)
+     */
+    if (cstate->rel->rd_rel->relkind != RELKIND_RELATION &&
+        cstate->rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
+        !(cstate->rel->trigdesc &&
+          cstate->rel->trigdesc->trig_insert_instead_row))
+    {
+        if (cstate->rel->rd_rel->relkind == RELKIND_VIEW)
+            ereport(ERROR,
+                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                     errmsg("cannot copy to view \"%s\"",
+                            RelationGetRelationName(cstate->rel)),
+                     errhint("To enable copying to a view, provide an INSTEAD OF INSERT trigger.")));
+        else if (cstate->rel->rd_rel->relkind == RELKIND_MATVIEW)
+            ereport(ERROR,
+                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                     errmsg("cannot copy to materialized view \"%s\"",
+                            RelationGetRelationName(cstate->rel))));
+        else if (cstate->rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                     errmsg("cannot copy to foreign table \"%s\"",
+                            RelationGetRelationName(cstate->rel))));
+        else if (cstate->rel->rd_rel->relkind == RELKIND_SEQUENCE)
+            ereport(ERROR,
+                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                     errmsg("cannot copy to sequence \"%s\"",
+                            RelationGetRelationName(cstate->rel))));
+        else
+            ereport(ERROR,
+                    (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+                     errmsg("cannot copy to non-table relation \"%s\"",
+                            RelationGetRelationName(cstate->rel))));
+    }
+
+    tupDesc = RelationGetDescr(cstate->rel);
+
+    /*----------
+     * Check to see if we can avoid writing WAL
+     *
+     * If archive logging/streaming is not enabled *and* either
+     *    - table was created in same transaction as this COPY
+     *    - data is being written to relfilenode created in this transaction
+     * then we can skip writing WAL.  It's safe because if the transaction
+     * doesn't commit, we'll discard the table (or the new relfilenode file).
+     * If it does commit, we'll have done the heap_sync at the bottom of this
+     * routine first.
+     *
+     * As mentioned in comments in utils/rel.h, the in-same-transaction test
+     * is not always set correctly, since in rare cases rd_newRelfilenodeSubid
+     * can be cleared before the end of the transaction. The exact case is
+     * when a relation sets a new relfilenode twice in same transaction, yet
+     * the second one fails in an aborted subtransaction, e.g.
+     *
+     * BEGIN;
+     * TRUNCATE t;
+     * SAVEPOINT save;
+     * TRUNCATE t;
+     * ROLLBACK TO save;
+     * COPY ...
+     *
+     * Also, if the target file is new-in-transaction, we assume that checking
+     * FSM for free space is a waste of time, even if we must use WAL because
+     * of archiving.  This could possibly be wrong, but it's unlikely.
+     *
+     * The comments for heap_insert and RelationGetBufferForTuple specify that
+     * skipping WAL logging is only safe if we ensure that our tuples do not
+     * go into pages containing tuples from any other transactions --- but this
+     * must be the case if we have a new table or new relfilenode, so we need
+     * no additional work to enforce that.
+     *----------
+     */
+    /* createSubid is creation check, newRelfilenodeSubid is truncation check */
+    if (cstate->rel->rd_createSubid != InvalidSubTransactionId ||
+        cstate->rel->rd_newRelfilenodeSubid != InvalidSubTransactionId)
+    {
+        hi_options |= HEAP_INSERT_SKIP_FSM;
+        if (!XLogIsNeeded())
+            hi_options |= HEAP_INSERT_SKIP_WAL;
+    }
+
+    /*
+     * Optimize if new relfilenode was created in this subxact or one of its
+     * committed children and we won't see those rows later as part of an
+     * earlier scan or command. This ensures that if this subtransaction
+     * aborts then the frozen rows won't be visible after xact cleanup. Note
+     * that the stronger test of exactly which subtransaction created it is
+     * crucial for correctness of this optimization.
+     */
+    if (cstate->freeze)
+    {
+        if (!ThereAreNoPriorRegisteredSnapshots() || !ThereAreNoReadyPortals())
+            ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+                     errmsg("cannot perform FREEZE because of prior transaction activity")));
+
+        if (cstate->rel->rd_createSubid != GetCurrentSubTransactionId() &&
+            cstate->rel->rd_newRelfilenodeSubid != GetCurrentSubTransactionId())
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                     errmsg("cannot perform FREEZE because the table was not created or truncated in the current subtransaction")));
+
+        hi_options |= HEAP_INSERT_FROZEN;
+    }
+
+    /*
+     * We need a ResultRelInfo so we can use the regular executor's
+     * index-entry-making machinery.  (There used to be a huge amount of code
+     * here that basically duplicated execUtils.c ...)
+     */
+    resultRelInfo = makeNode(ResultRelInfo);
+    InitResultRelInfo(resultRelInfo,
+                      cstate->rel,
+                      1,        /* dummy rangetable index */
+                      NULL,
+                      0);
+
+    ExecOpenIndices(resultRelInfo, false);
+
+    estate->es_result_relations = resultRelInfo;
+    estate->es_num_result_relations = 1;
+    estate->es_result_relation_info = resultRelInfo;
+    estate->es_range_table = cstate->range_table;
+
+    /* Set up a tuple slot too */
+    myslot = ExecInitExtraTupleSlot(estate);
+    ExecSetSlotDescriptor(myslot, tupDesc);
+    /* Triggers might need a slot as well */
+    estate->es_trig_tuple_slot = ExecInitExtraTupleSlot(estate);
+
+    /*
+     * It's more efficient to prepare a bunch of tuples for insertion, and
+     * insert them in one heap_multi_insert() call, than call heap_insert()
+     * separately for every tuple. However, we can't do that if there are
+     * BEFORE/INSTEAD OF triggers, or we need to evaluate volatile default
+     * expressions. Such triggers or expressions might query the table we're
+     * inserting to, and act differently if the tuples that have already been
+     * processed and prepared for insertion are not there.  We also can't do
+     * it if the table is partitioned.
+     */
+    useHeapMultiInsert = !((resultRelInfo->ri_TrigDesc != NULL &&
+         (resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
+          resultRelInfo->ri_TrigDesc->trig_insert_instead_row)) ||
+        cstate->partition_dispatch_info != NULL ||
+        cstate->volatile_defexprs);
+
+    if (useHeapMultiInsert)
+        bufferedTuples = palloc(MAX_BUFFERED_TUPLES * sizeof(HeapTuple));
+
+    /* Prepare to catch AFTER triggers. */
+    AfterTriggerBeginQuery();
+
+    /*
+     * Check BEFORE STATEMENT insertion triggers. It's debatable whether we
+     * should do this for COPY, since it's not really an "INSERT" statement as
+     * such. However, executing these triggers maintains consistency with the
+     * EACH ROW triggers that we already fire on COPY.
+     */
+    ExecBSInsertTriggers(estate, resultRelInfo);
+
+    bistate = GetBulkInsertState();
+    econtext = GetPerTupleExprContext(estate);
+
+    /* Set up callback to identify error line number */
+    errcallback.callback = CopyFromErrorCallback;
+    errcallback.arg = (void *) cstate;
+    errcallback.previous = error_context_stack;
+    error_context_stack = &errcallback;
+
+    /* Do the work. */
+    values = (Datum *) palloc(tupDesc->natts * sizeof(Datum));
+    nulls = (bool *) palloc(tupDesc->natts * sizeof(bool));
 
     for (;;)
     {
         char *msg;
+        bool  skip_tuple;
+        Oid   loaded_oid = InvalidOid;
+        int   next_cf_state; /* NextCopyFrom return state */
+        TupleTableSlot *slot;
+
+
+        if (nBufferedTuples == 0)
+        {
+            /*
+             * Reset the per-tuple exprcontext. We can only do this if the
+             * tuple buffer is empty. (Calling the context the per-tuple
+             * memory context is a bit of a misnomer now.)
+             */
+            ResetPerTupleExprContext(estate);
+        }
+
+		/* Switch into its memory context */
+        MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
         CHECK_FOR_INTERRUPTS();
 
@@ -5221,9 +5406,326 @@ CopyFromBgwMainLoop(Datum main_arg)
             elog(LOG, "BGWorker #%d: got zero-length message, stopping", myworkernumber);
             break;
         }
-        // elog(LOG, "BGWorker #%d dummy processing line #%ld", myworkernumber, *(int64 *) data);
-        elog(LOG, "BGWorker #%d dummy processing line: %s", myworkernumber, msg);
+        elog(LOG, "BGWorker #%d processing line: %s", myworkernumber, msg);
+
+        cstate->line_buf.data = msg;
+        cstate->line_buf.len  = len;
+
+        next_cf_state = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
+
+        if (!next_cf_state) {
+            break;
+        }
+            else if (next_cf_state == NCF_SUCCESS)
+            {
+                /* And now we can form the input tuple. */
+                tuple = heap_form_tuple(tupDesc, values, nulls);
+
+                if (loaded_oid != InvalidOid)
+                    HeapTupleSetOid(tuple, loaded_oid);
+
+                /*
+                 * Constraints might reference the tableoid column, so initialize
+                 * t_tableOid before evaluating them.
+                 */
+                tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+
+                /* Triggers and stuff need to be invoked in query context. */
+                MemoryContextSwitchTo(oldcontext);
+
+                /* Place tuple in tuple slot --- but slot shouldn't free it */
+                slot = myslot;
+                ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+
+                /* Determine the partition to heap_insert the tuple into */
+                if (cstate->partition_dispatch_info)
+                {
+                    int            leaf_part_index;
+                    TupleConversionMap *map;
+
+                    /*
+                     * Away we go ... If we end up not finding a partition after all,
+                     * ExecFindPartition() does not return and errors out instead.
+                     * Otherwise, the returned value is to be used as an index into
+                     * arrays mt_partitions[] and mt_partition_tupconv_maps[] that
+                     * will get us the ResultRelInfo and TupleConversionMap for the
+                     * partition, respectively.
+                     */
+                    leaf_part_index = ExecFindPartition(resultRelInfo,
+                                                        cstate->partition_dispatch_info,
+                                                        slot,
+                                                        estate);
+                    Assert(leaf_part_index >= 0 &&
+                           leaf_part_index < cstate->num_partitions);
+
+                    /*
+                     * If this tuple is mapped to a partition that is not same as the
+                     * previous one, we'd better make the bulk insert mechanism gets a
+                     * new buffer.
+                     */
+                    if (prev_leaf_part_index != leaf_part_index)
+                    {
+                        ReleaseBulkInsertStatePin(bistate);
+                        prev_leaf_part_index = leaf_part_index;
+                    }
+
+                    /*
+                     * Save the old ResultRelInfo and switch to the one corresponding
+                     * to the selected partition.
+                     */
+                    saved_resultRelInfo = resultRelInfo;
+                    resultRelInfo = cstate->partitions + leaf_part_index;
+
+                    /* We do not yet have a way to insert into a foreign partition */
+                    if (resultRelInfo->ri_FdwRoutine)
+                        ereport(ERROR,
+                                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                                 errmsg("cannot route inserted tuples to a foreign table")));
+
+                    /*
+                     * For ExecInsertIndexTuples() to work on the partition's indexes
+                     */
+                    estate->es_result_relation_info = resultRelInfo;
+
+                    /*
+                     * If we're capturing transition tuples, we might need to convert
+                     * from the partition rowtype to parent rowtype.
+                     */
+                    if (cstate->transition_capture != NULL)
+                    {
+                        if (resultRelInfo->ri_TrigDesc &&
+                            (resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
+                             resultRelInfo->ri_TrigDesc->trig_insert_instead_row))
+                        {
+                            /*
+                             * If there are any BEFORE or INSTEAD triggers on the
+                             * partition, we'll have to be ready to convert their
+                             * result back to tuplestore format.
+                             */
+                            cstate->transition_capture->tcs_original_insert_tuple = NULL;
+                            cstate->transition_capture->tcs_map =
+                                cstate->transition_tupconv_maps[leaf_part_index];
+                        }
+                        else
+                        {
+                            /*
+                             * Otherwise, just remember the original unconverted
+                             * tuple, to avoid a needless round trip conversion.
+                             */
+                            cstate->transition_capture->tcs_original_insert_tuple = tuple;
+                            cstate->transition_capture->tcs_map = NULL;
+                        }
+                    }
+                    /*
+                     * We might need to convert from the parent rowtype to the
+                     * partition rowtype.
+                     */
+                    map = cstate->partition_tupconv_maps[leaf_part_index];
+                    if (map)
+                    {
+                        Relation    partrel = resultRelInfo->ri_RelationDesc;
+
+                        tuple = do_convert_tuple(tuple, map);
+
+                        /*
+                         * We must use the partition's tuple descriptor from this
+                         * point on.  Use a dedicated slot from this point on until
+                         * we're finished dealing with the partition.
+                         */
+                        slot = cstate->partition_tuple_slot;
+                        Assert(slot != NULL);
+                        ExecSetSlotDescriptor(slot, RelationGetDescr(partrel));
+                        ExecStoreTuple(tuple, slot, InvalidBuffer, true);
+                    }
+
+                    tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+                }
+
+                skip_tuple = false;
+
+                /* BEFORE ROW INSERT Triggers */
+                if (resultRelInfo->ri_TrigDesc &&
+                    resultRelInfo->ri_TrigDesc->trig_insert_before_row)
+                {
+                    slot = ExecBRInsertTriggers(estate, resultRelInfo, slot);
+
+                    if (slot == NULL)    /* "do nothing" */
+                        skip_tuple = true;
+                    else                /* trigger might have changed tuple */
+                        tuple = ExecMaterializeSlot(slot);
+                }
+            }
+            else
+            {
+                skip_tuple = true;
+            }
+
+        if (!skip_tuple)
+        {
+            if (resultRelInfo->ri_TrigDesc &&
+                resultRelInfo->ri_TrigDesc->trig_insert_instead_row)
+            {
+                /* Pass the data to the INSTEAD ROW INSERT trigger */
+                ExecIRInsertTriggers(estate, resultRelInfo, slot);
+            }
+            else
+            {
+                /*
+                 * We always check the partition constraint, including when
+                 * the tuple got here via tuple-routing.  However we don't
+                 * need to in the latter case if no BR trigger is defined on
+                 * the partition.  Note that a BR trigger might modify the
+                 * tuple such that the partition constraint is no longer
+                 * satisfied, so we need to check in that case.
+                 */
+                bool        check_partition_constr =
+                (resultRelInfo->ri_PartitionCheck != NIL);
+
+                if (saved_resultRelInfo != NULL &&
+                    !(resultRelInfo->ri_TrigDesc &&
+                      resultRelInfo->ri_TrigDesc->trig_insert_before_row))
+                    check_partition_constr = false;
+
+                /* Check the constraints of the tuple */
+                if (cstate->rel->rd_att->constr || check_partition_constr)
+                    ExecConstraints(resultRelInfo, slot, estate);
+
+                if (useHeapMultiInsert)
+                {
+                    /* Add this tuple to the tuple buffer */
+                    if (nBufferedTuples == 0)
+                        firstBufferedLineNo = cstate->cur_lineno;
+                    bufferedTuples[nBufferedTuples++] = tuple;
+                    bufferedTuplesSize += tuple->t_len;
+
+                    /*
+                     * If the buffer filled up, flush it.  Also flush if the
+                     * total size of all the tuples in the buffer becomes
+                     * large, to avoid using large amounts of memory for the
+                     * buffer when the tuples are exceptionally wide.
+                     */
+                    if (nBufferedTuples == MAX_BUFFERED_TUPLES ||
+                        bufferedTuplesSize > 65535)
+                    {
+                        CopyFromInsertBatch(cstate, estate, mycid, hi_options,
+                                            resultRelInfo, myslot, bistate,
+                                            nBufferedTuples, bufferedTuples,
+                                            firstBufferedLineNo);
+                        nBufferedTuples = 0;
+                        bufferedTuplesSize = 0;
+                    }
+                }
+                else
+                {
+                    List       *recheckIndexes = NIL;
+
+                    /* OK, store the tuple and create index entries for it */
+                    heap_insert(resultRelInfo->ri_RelationDesc, tuple, mycid,
+                                hi_options, bistate);
+
+                    if (resultRelInfo->ri_NumIndices > 0)
+                        recheckIndexes = ExecInsertIndexTuples(slot,
+                                                               &(tuple->t_self),
+                                                               estate,
+                                                               false,
+                                                               NULL,
+                                                               NIL);
+
+                    /* AFTER ROW INSERT Triggers */
+                    ExecARInsertTriggers(estate, resultRelInfo, tuple,
+                                         recheckIndexes, cstate->transition_capture);
+
+                    list_free(recheckIndexes);
+                }
+            }
+
+            /*
+             * We count only tuples not suppressed by a BEFORE INSERT trigger;
+             * this is the same definition used by execMain.c for counting
+             * tuples inserted by an INSERT command.
+             */
+            processed++;
+
+            if (saved_resultRelInfo)
+            {
+                resultRelInfo = saved_resultRelInfo;
+                estate->es_result_relation_info = resultRelInfo;
+            }
+        }
     }
+
+    /* Flush any remaining buffered tuples */
+    if (nBufferedTuples > 0)
+        CopyFromInsertBatch(cstate, estate, mycid, hi_options,
+                            resultRelInfo, myslot, bistate,
+                            nBufferedTuples, bufferedTuples,
+                            firstBufferedLineNo);
+
+    /* Done, clean up */
+    error_context_stack = errcallback.previous;
+
+    FreeBulkInsertState(bistate);
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * In the old protocol, tell pqcomm that we can process normal protocol
+	 * messages again.
+	 */
+	if (cstate->copy_dest == COPY_OLD_FE)
+		pq_endmsgread();
+
+	/* Execute AFTER STATEMENT insertion triggers */
+    ExecASInsertTriggers(estate, resultRelInfo, cstate->transition_capture);
+
+	/* Handle queued AFTER triggers */
+    AfterTriggerEndQuery(estate);
+
+    ExecResetTupleTable(estate->es_tupleTable, false);
+
+    ExecCloseIndices(resultRelInfo);
+
+	/* Close all the partitioned tables, leaf partitions, and their indices */
+	if (cstate->partition_dispatch_info)
+	{
+		int			i;
+
+		/*
+		 * Remember cstate->partition_dispatch_info[0] corresponds to the root
+		 * partitioned table, which we must not try to close, because it is
+		 * the main target table of COPY that will be closed eventually by
+		 * DoCopy().  Also, tupslot is NULL for the root partitioned table.
+		 */
+		for (i = 1; i < cstate->num_dispatch; i++)
+		{
+			PartitionDispatch pd = cstate->partition_dispatch_info[i];
+
+			heap_close(pd->reldesc, NoLock);
+			ExecDropSingleTupleTableSlot(pd->tupslot);
+		}
+		for (i = 0; i < cstate->num_partitions; i++)
+		{
+			ResultRelInfo *resultRelInfo = cstate->partitions + i;
+
+			ExecCloseIndices(resultRelInfo);
+			heap_close(resultRelInfo->ri_RelationDesc, NoLock);
+		}
+
+		/* Release the standalone partition tuple descriptor */
+		ExecDropSingleTupleTableSlot(cstate->partition_tuple_slot);
+	}
+
+	/* Close any trigger target relations */
+    ExecCleanUpTriggerState(estate);
+
+    FreeExecutorState(estate);
+
+	/*
+	 * If we skipped writing WAL, then we need to sync the heap (but not
+	 * indexes since those use WAL anyway)
+	 */
+    if (hi_options & HEAP_INSERT_SKIP_WAL)
+        heap_sync(cstate->rel);
 
     heap_close(rel, NoLock);
         // (is_from ? NoLock : AccessShareLock));
@@ -5231,13 +5733,28 @@ CopyFromBgwMainLoop(Datum main_arg)
 
     LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
     ++pst->workers_finished;
+    pst->processed += processed;
+
+    // if (pst->workers_finished == pst->workers_total)
+    // {
+    //     registrant = BackendPidGetProc(MyBgworkerEntry->bgw_notify_pid);
+    //     if (registrant == NULL)
+    //     {
+    //         elog(DEBUG1, "registrant backend has exited prematurely");
+    //         proc_exit(1);
+    //     }
+    //     SetLatch(&registrant->procLatch);
+    // }
     LWLockRelease(CopyFromBgwLock);
 
     /* Signal main process that we are done. */
     ConditionVariableBroadcast(&cv);
 
-	pfree(values);
-	pfree(nulls);
+    // TODO Segmentation fault:
+    // * frame #0: 0x0000000107519678 postgres`GetMemoryChunkContext(pointer=0x00007fdf268bf858) at memutils.h:124
+    //   frame #1: 0x00000001075194e5 postgres`pfree(pointer=0x00007fdf268bf858) at mcxt.c:952
+    // pfree(values);
+    // pfree(nulls);
 
     /*
      * We're done.  Explicitly detach the shared memory segment so that we
@@ -5307,6 +5824,10 @@ setup_parallel_copy_from(int64 queue_size, int32 nworkers, dsm_segment **segp,
 
     /* Wait for workers to become ready. */
     wait_for_workers_to_become_ready(wstate, pst);
+    /* Wait to be signalled. */
+    // WaitLatch(MyLatch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
+    /* Reset the latch so we don't spin. */
+    // ResetLatch(MyLatch);
 
     /*
      * Once we reach this point, all workers are ready.  We no longer need to
@@ -5342,10 +5863,7 @@ setup_dsm(int64 queue_size, int nworkers,
     dsm_segment      *seg;
     shm_toc          *toc;
     ParallelState    *pst;
-    char             *shm_filename;
-    List             *shm_p_rtable;
-    List             *shm_attnamelist;
-    List             *shm_options;
+    char             *shm_query;
 
 	Assert(cstate->rel);
 
@@ -5372,15 +5890,12 @@ setup_dsm(int64 queue_size, int nworkers,
     shm_toc_initialize_estimator(&e);
     shm_toc_estimate_chunk(&e, sizeof(ParallelState));
 
-    shm_toc_estimate_chunk(&e, sizeof(*pstate->p_rtable));
     shm_toc_estimate_chunk(&e, strlen(ActivePortal->sourceText) * sizeof(char));
-    // shm_toc_estimate_chunk(&e, sizeof(*attnamelist));
-    shm_toc_estimate_chunk(&e, sizeof(*options));
 
     for (i = 0; i < nworkers; ++i)
         shm_toc_estimate_chunk(&e, (Size) queue_size);
 
-    shm_toc_estimate_keys(&e, 1 + 4 + nworkers);
+    shm_toc_estimate_keys(&e, 1 + 1 + nworkers);
     segsize = shm_toc_estimate(&e);
 
     /* Create the shared memory segment and establish a table of contents. */
@@ -5395,211 +5910,18 @@ setup_dsm(int64 queue_size, int nworkers,
     pst->workers_attached = 0;
     pst->workers_ready = 0;
     pst->workers_finished = 0;
+    pst->processed = 0;
     pst->database_id = MyDatabaseId;
     pst->authenticated_user_id = GetAuthenticatedUserId();
     ConditionVariableInit(&pst->cv);
 
-    pst->is_program = cstate->is_program;
-    pst->rel = cstate->rel;
-
-    pst->estate = CreateExecutorState(); /* for ExecConstraints() */
-    pst->mycid = GetCurrentCommandId(true);
-    pst->hi_options = 0; /* start with default heap_insert options */
-
-    /*
-     * The target must be a plain relation or have an INSTEAD OF INSERT row
-     * trigger.  (Currently, such triggers are only allowed on views, so we
-     * only hint about them in the view case.)
-     */
-    if (cstate->rel->rd_rel->relkind != RELKIND_RELATION &&
-    	cstate->rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE &&
-    	!(cstate->rel->trigdesc &&
-    	  cstate->rel->trigdesc->trig_insert_instead_row))
-    {
-    	if (cstate->rel->rd_rel->relkind == RELKIND_VIEW)
-    		ereport(ERROR,
-    				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-    				 errmsg("cannot copy to view \"%s\"",
-    						RelationGetRelationName(cstate->rel)),
-    				 errhint("To enable copying to a view, provide an INSTEAD OF INSERT trigger.")));
-    	else if (cstate->rel->rd_rel->relkind == RELKIND_MATVIEW)
-    		ereport(ERROR,
-    				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-    				 errmsg("cannot copy to materialized view \"%s\"",
-    						RelationGetRelationName(cstate->rel))));
-    	else if (cstate->rel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
-    		ereport(ERROR,
-    				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-    				 errmsg("cannot copy to foreign table \"%s\"",
-    						RelationGetRelationName(cstate->rel))));
-    	else if (cstate->rel->rd_rel->relkind == RELKIND_SEQUENCE)
-    		ereport(ERROR,
-    				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-    				 errmsg("cannot copy to sequence \"%s\"",
-    						RelationGetRelationName(cstate->rel))));
-    	else
-    		ereport(ERROR,
-    				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-    				 errmsg("cannot copy to non-table relation \"%s\"",
-    						RelationGetRelationName(cstate->rel))));
-    }
-
-    pst->tupDesc = RelationGetDescr(cstate->rel);
-
-    /*----------
-     * Check to see if we can avoid writing WAL
-     *
-     * If archive logging/streaming is not enabled *and* either
-     *	- table was created in same transaction as this COPY
-     *	- data is being written to relfilenode created in this transaction
-     * then we can skip writing WAL.  It's safe because if the transaction
-     * doesn't commit, we'll discard the table (or the new relfilenode file).
-     * If it does commit, we'll have done the heap_sync at the bottom of this
-     * routine first.
-     *
-     * As mentioned in comments in utils/rel.h, the in-same-transaction test
-     * is not always set correctly, since in rare cases rd_newRelfilenodeSubid
-     * can be cleared before the end of the transaction. The exact case is
-     * when a relation sets a new relfilenode twice in same transaction, yet
-     * the second one fails in an aborted subtransaction, e.g.
-     *
-     * BEGIN;
-     * TRUNCATE t;
-     * SAVEPOINT save;
-     * TRUNCATE t;
-     * ROLLBACK TO save;
-     * COPY ...
-     *
-     * Also, if the target file is new-in-transaction, we assume that checking
-     * FSM for free space is a waste of time, even if we must use WAL because
-     * of archiving.  This could possibly be wrong, but it's unlikely.
-     *
-     * The comments for heap_insert and RelationGetBufferForTuple specify that
-     * skipping WAL logging is only safe if we ensure that our tuples do not
-     * go into pages containing tuples from any other transactions --- but this
-     * must be the case if we have a new table or new relfilenode, so we need
-     * no additional work to enforce that.
-     *----------
-     */
-    /* createSubid is creation check, newRelfilenodeSubid is truncation check */
-    if (cstate->rel->rd_createSubid != InvalidSubTransactionId ||
-    	cstate->rel->rd_newRelfilenodeSubid != InvalidSubTransactionId)
-    {
-    	pst->hi_options |= HEAP_INSERT_SKIP_FSM;
-    	if (!XLogIsNeeded())
-    		pst->hi_options |= HEAP_INSERT_SKIP_WAL;
-    }
-
-    /*
-     * Optimize if new relfilenode was created in this subxact or one of its
-     * committed children and we won't see those rows later as part of an
-     * earlier scan or command. This ensures that if this subtransaction
-     * aborts then the frozen rows won't be visible after xact cleanup. Note
-     * that the stronger test of exactly which subtransaction created it is
-     * crucial for correctness of this optimization.
-     */
-    if (cstate->freeze)
-    {
-    	if (!ThereAreNoPriorRegisteredSnapshots() || !ThereAreNoReadyPortals())
-    		ereport(ERROR,
-    				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-    				 errmsg("cannot perform FREEZE because of prior transaction activity")));
-
-    	if (cstate->rel->rd_createSubid != GetCurrentSubTransactionId() &&
-    		cstate->rel->rd_newRelfilenodeSubid != GetCurrentSubTransactionId())
-    		ereport(ERROR,
-    				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-    				 errmsg("cannot perform FREEZE because the table was not created or truncated in the current subtransaction")));
-
-    	pst->hi_options |= HEAP_INSERT_FROZEN;
-    }
-
-    /*
-     * We need a ResultRelInfo so we can use the regular executor's
-     * index-entry-making machinery.  (There used to be a huge amount of code
-     * here that basically duplicated execUtils.c ...)
-     */
-    pst->resultRelInfo = makeNode(ResultRelInfo);
-    InitResultRelInfo(pst->resultRelInfo,
-    				  cstate->rel,
-    				  1,		/* dummy rangetable index */
-    				  NULL,
-    				  0);
-
-    ExecOpenIndices(pst->resultRelInfo, false);
-
-    pst->estate->es_result_relations = pst->resultRelInfo;
-    pst->estate->es_num_result_relations = 1;
-    pst->estate->es_result_relation_info = pst->resultRelInfo;
-    pst->estate->es_range_table = cstate->range_table;
-
-    /* Set up a tuple slot too */
-    pst->myslot = ExecInitExtraTupleSlot(pst->estate);
-    ExecSetSlotDescriptor(pst->myslot, pst->tupDesc);
-    /* Triggers might need a slot as well */
-    pst->estate->es_trig_tuple_slot = ExecInitExtraTupleSlot(pst->estate);
-
-    /*
-     * It's more efficient to prepare a bunch of tuples for insertion, and
-     * insert them in one heap_multi_insert() call, than call heap_insert()
-     * separately for every tuple. However, we can't do that if there are
-     * BEFORE/INSTEAD OF triggers, or we need to evaluate volatile default
-     * expressions. Such triggers or expressions might query the table we're
-     * inserting to, and act differently if the tuples that have already been
-     * processed and prepared for insertion are not there.  We also can't do
-     * it if the table is partitioned.
-     */
-    pst->useHeapMultiInsert = !((pst->resultRelInfo->ri_TrigDesc != NULL &&
-    	 (pst->resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
-    	  pst->resultRelInfo->ri_TrigDesc->trig_insert_instead_row)) ||
-    	cstate->partition_dispatch_info != NULL ||
-    	cstate->volatile_defexprs);
-
-    /* Prepare to catch AFTER triggers. */
-    AfterTriggerBeginQuery();
-
-    /*
-     * Check BEFORE STATEMENT insertion triggers. It's debatable whether we
-     * should do this for COPY, since it's not really an "INSERT" statement as
-     * such. However, executing these triggers maintains consistency with the
-     * EACH ROW triggers that we already fire on COPY.
-     */
-    ExecBSInsertTriggers(pst->estate, pst->resultRelInfo);
-
-    pst->bistate = GetBulkInsertState();
-    pst->econtext = GetPerTupleExprContext(pst->estate);
-
-    /* Set up callback to identify error line number */
-    pst->errcallback.callback = CopyFromErrorCallback;
-    pst->errcallback.arg = (void *) cstate;
-    pst->errcallback.previous = error_context_stack;
-    error_context_stack = &pst->errcallback;
-
     shm_toc_insert(toc, toc_key++, pst);
 
-    shm_p_rtable    = shm_toc_allocate(toc, sizeof(*pstate->p_rtable));
-    shm_filename    = shm_toc_allocate(toc, strlen(ActivePortal->sourceText) * sizeof(char));
-    // shm_attnamelist = shm_toc_allocate(toc, sizeof(*attnamelist));
-    shm_options     = shm_toc_allocate(toc, sizeof(*options));
+    shm_query    = shm_toc_allocate(toc, strlen(ActivePortal->sourceText) * sizeof(char));
 
-    *shm_p_rtable    = *pstate->p_rtable;
-    // *shm_attnamelist = *attnamelist;
-    *shm_options     = *options;
-    strcpy(shm_filename, ActivePortal->sourceText);
+    strcpy(shm_query, ActivePortal->sourceText);
 
-    shm_toc_insert(toc, toc_key++, shm_p_rtable);
-    shm_toc_insert(toc, toc_key++, shm_filename);
-    // shm_toc_insert(toc, toc_key++, shm_attnamelist);
-    shm_toc_insert(toc, toc_key++, shm_options);
-
-    // cst = shm_toc_allocate(toc, sizeof(CopyStateData) + strlen(cstate->filename) * sizeof(char));
-    // *cst = *cstate;
-    // cst->filename = shm_toc_allocate(toc, strlen(cstate->filename) * sizeof(char));
-    // // *cst->filename = *cstate->filename;
-    // strcpy(cst->filename, cstate->filename);
-    // // memcpy(cst->filename, cstate->filename, sizeof(*cstate->filename));
-    // // memcpy(cstate, cst, sizeof(CopyStateData));
-    // shm_toc_insert(toc, 1, cst);
+    shm_toc_insert(toc, toc_key++, shm_query);
 
     /* Set up one message queue per worker, plus one. */
     for (i = 0; i < nworkers; ++i)
@@ -5807,436 +6129,6 @@ wait_for_workers_to_finish(volatile ParallelState *pst)
     ConditionVariableCancelSleep();
 }
 
-// /*
-//  * Parse the current line into separate attributes (fields),
-//  * performing de-escaping as needed.
-//  *
-//  * The input is in line_buf.  We use attribute_buf to hold the result
-//  * strings.  cstate->raw_fields[k] is set to point to the k'th attribute
-//  * string, or NULL when the input matches the null marker string.
-//  * This array is expanded as necessary.
-//  *
-//  * (Note that the caller cannot check for nulls since the returned
-//  * string would be the post-de-escaping equivalent, which may look
-//  * the same as some valid data string.)
-//  *
-//  * delim is the column delimiter string (must be just one byte for now).
-//  * null_print is the null marker string.  Note that this is compared to
-//  * the pre-de-escaped input string.
-//  *
-//  * The return value is the number of fields actually read.
-//  */
-// static int
-// CopyReadTextAttrs(CopyState cstate)
-// {
-//     char        delimc = cstate->delim[0];
-//     int            fieldno;
-//     char       *output_ptr;
-//     char       *cur_ptr;
-//     char       *line_end_ptr;
-//
-//     /*
-//      * We need a special case for zero-column tables: check that the input
-//      * line is empty, and return.
-//      */
-//     if (cstate->max_fields <= 0)
-//     {
-//         if (cstate->line_buf.len != 0)
-//             ereport(ERROR,
-//                     (errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-//                      errmsg("extra data after last expected column")));
-//         return 0;
-//     }
-//
-//     resetStringInfo(&cstate->attribute_buf);
-//
-//     /*
-//      * The de-escaped attributes will certainly not be longer than the input
-//      * data line, so we can just force attribute_buf to be large enough and
-//      * then transfer data without any checks for enough space.  We need to do
-//      * it this way because enlarging attribute_buf mid-stream would invalidate
-//      * pointers already stored into cstate->raw_fields[].
-//      */
-//     if (cstate->attribute_buf.maxlen <= cstate->line_buf.len)
-//         enlargeStringInfo(&cstate->attribute_buf, cstate->line_buf.len);
-//     output_ptr = cstate->attribute_buf.data;
-//
-//     /* set pointer variables for loop */
-//     cur_ptr = cstate->line_buf.data;
-//     line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
-//
-//     /* Outer loop iterates over fields */
-//     fieldno = 0;
-//     for (;;)
-//     {
-//         bool        found_delim = false;
-//         char       *start_ptr;
-//         char       *end_ptr;
-//         int            input_len;
-//         bool        saw_non_ascii = false;
-//
-//         /* Make sure there is enough space for the next value */
-//         if (fieldno >= cstate->max_fields)
-//         {
-//             cstate->max_fields *= 2;
-//             cstate->raw_fields =
-//                 repalloc(cstate->raw_fields, cstate->max_fields * sizeof(char *));
-//         }
-//
-//         /* Remember start of field on both input and output sides */
-//         start_ptr = cur_ptr;
-//         cstate->raw_fields[fieldno] = output_ptr;
-//
-//         /*
-//          * Scan data for field.
-//          *
-//          * Note that in this loop, we are scanning to locate the end of field
-//          * and also speculatively performing de-escaping.  Once we find the
-//          * end-of-field, we can match the raw field contents against the null
-//          * marker string.  Only after that comparison fails do we know that
-//          * de-escaping is actually the right thing to do; therefore we *must
-//          * not* throw any syntax errors before we've done the null-marker
-//          * check.
-//          */
-//         for (;;)
-//         {
-//             char        c;
-//
-//             end_ptr = cur_ptr;
-//             if (cur_ptr >= line_end_ptr)
-//                 break;
-//             c = *cur_ptr++;
-//             if (c == delimc)
-//             {
-//                 found_delim = true;
-//                 break;
-//             }
-//             if (c == '\\')
-//             {
-//                 if (cur_ptr >= line_end_ptr)
-//                     break;
-//                 c = *cur_ptr++;
-//                 switch (c)
-//                 {
-//                     case '0':
-//                     case '1':
-//                     case '2':
-//                     case '3':
-//                     case '4':
-//                     case '5':
-//                     case '6':
-//                     case '7':
-//                         {
-//                             /* handle \013 */
-//                             int            val;
-//
-//                             val = OCTVALUE(c);
-//                             if (cur_ptr < line_end_ptr)
-//                             {
-//                                 c = *cur_ptr;
-//                                 if (ISOCTAL(c))
-//                                 {
-//                                     cur_ptr++;
-//                                     val = (val << 3) + OCTVALUE(c);
-//                                     if (cur_ptr < line_end_ptr)
-//                                     {
-//                                         c = *cur_ptr;
-//                                         if (ISOCTAL(c))
-//                                         {
-//                                             cur_ptr++;
-//                                             val = (val << 3) + OCTVALUE(c);
-//                                         }
-//                                     }
-//                                 }
-//                             }
-//                             c = val & 0377;
-//                             if (c == '\0' || IS_HIGHBIT_SET(c))
-//                                 saw_non_ascii = true;
-//                         }
-//                         break;
-//                     case 'x':
-//                         /* Handle \x3F */
-//                         if (cur_ptr < line_end_ptr)
-//                         {
-//                             char        hexchar = *cur_ptr;
-//
-//                             if (isxdigit((unsigned char) hexchar))
-//                             {
-//                                 int            val = GetDecimalFromHex(hexchar);
-//
-//                                 cur_ptr++;
-//                                 if (cur_ptr < line_end_ptr)
-//                                 {
-//                                     hexchar = *cur_ptr;
-//                                     if (isxdigit((unsigned char) hexchar))
-//                                     {
-//                                         cur_ptr++;
-//                                         val = (val << 4) + GetDecimalFromHex(hexchar);
-//                                     }
-//                                 }
-//                                 c = val & 0xff;
-//                                 if (c == '\0' || IS_HIGHBIT_SET(c))
-//                                     saw_non_ascii = true;
-//                             }
-//                         }
-//                         break;
-//                     case 'b':
-//                         c = '\b';
-//                         break;
-//                     case 'f':
-//                         c = '\f';
-//                         break;
-//                     case 'n':
-//                         c = '\n';
-//                         break;
-//                     case 'r':
-//                         c = '\r';
-//                         break;
-//                     case 't':
-//                         c = '\t';
-//                         break;
-//                     case 'v':
-//                         c = '\v';
-//                         break;
-//
-//                         /*
-//                          * in all other cases, take the char after '\'
-//                          * literally
-//                          */
-//                 }
-//             }
-//
-//             /* Add c to output string */
-//             *output_ptr++ = c;
-//         }
-//
-//         /* Check whether raw input matched null marker */
-//         input_len = end_ptr - start_ptr;
-//         if (input_len == cstate->null_print_len &&
-//             strncmp(start_ptr, cstate->null_print, input_len) == 0)
-//             cstate->raw_fields[fieldno] = NULL;
-//         else
-//         {
-//             /*
-//              * At this point we know the field is supposed to contain data.
-//              *
-//              * If we de-escaped any non-7-bit-ASCII chars, make sure the
-//              * resulting string is valid data for the db encoding.
-//              */
-//             if (saw_non_ascii)
-//             {
-//                 char       *fld = cstate->raw_fields[fieldno];
-//
-//                 pg_verifymbstr(fld, output_ptr - fld, false);
-//             }
-//         }
-//
-//         /* Terminate attribute value in output area */
-//         *output_ptr++ = '\0';
-//
-//         fieldno++;
-//         /* Done if we hit EOL instead of a delim */
-//         if (!found_delim)
-//             break;
-//     }
-//
-//     /* Clean up state of attribute_buf */
-//     output_ptr--;
-//     Assert(*output_ptr == '\0');
-//     cstate->attribute_buf.len = (output_ptr - cstate->attribute_buf.data);
-//
-//     return fieldno;
-// }
-//
-// /*
-//  * Parse the current line into separate attributes (fields),
-//  * performing de-escaping as needed.  This has exactly the same API as
-//  * CopyReadAttributesText, except we parse the fields according to
-//  * "standard" (i.e. common) CSV usage.
-//  */
-// static int
-// CopyReadCSVAttrs(CopyState cstate)
-// {
-//     char        delimc = cstate->delim[0];
-//     char        quotec = cstate->quote[0];
-//     char        escapec = cstate->escape[0];
-//     int            fieldno;
-//     char       *output_ptr;
-//     char       *cur_ptr;
-//     char       *line_end_ptr;
-//
-//     /*
-//      * We need a special case for zero-column tables: check that the input
-//      * line is empty, and return.
-//      */
-//     if (cstate->max_fields <= 0)
-//     {
-//         if (cstate->line_buf.len != 0)
-//             ereport(ERROR,
-//                     (errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-//                      errmsg("extra data after last expected column")));
-//         return 0;
-//     }
-//
-//     resetStringInfo(&cstate->attribute_buf);
-//
-//     /*
-//      * The de-escaped attributes will certainly not be longer than the input
-//      * data line, so we can just force attribute_buf to be large enough and
-//      * then transfer data without any checks for enough space.  We need to do
-//      * it this way because enlarging attribute_buf mid-stream would invalidate
-//      * pointers already stored into cstate->raw_fields[].
-//      */
-//     if (cstate->attribute_buf.maxlen <= cstate->line_buf.len)
-//         enlargeStringInfo(&cstate->attribute_buf, cstate->line_buf.len);
-//     output_ptr = cstate->attribute_buf.data;
-//
-//     /* set pointer variables for loop */
-//     cur_ptr = cstate->line_buf.data;
-//     line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
-//
-//     /* Outer loop iterates over fields */
-//     fieldno = 0;
-//     for (;;)
-//     {
-//         bool        found_delim = false;
-//         bool        saw_quote = false;
-//         char       *start_ptr;
-//         char       *end_ptr;
-//         int            input_len;
-//
-//         /* Make sure there is enough space for the next value */
-//         if (fieldno >= cstate->max_fields)
-//         {
-//             cstate->max_fields *= 2;
-//             cstate->raw_fields =
-//                 repalloc(cstate->raw_fields, cstate->max_fields * sizeof(char *));
-//         }
-//
-//         /* Remember start of field on both input and output sides */
-//         start_ptr = cur_ptr;
-//         cstate->raw_fields[fieldno] = output_ptr;
-//
-//         /*
-//          * Scan data for field,
-//          *
-//          * The loop starts in "not quote" mode and then toggles between that
-//          * and "in quote" mode. The loop exits normally if it is in "not
-//          * quote" mode and a delimiter or line end is seen.
-//          */
-//         for (;;)
-//         {
-//             char        c;
-//
-//             /* Not in quote */
-//             for (;;)
-//             {
-//                 end_ptr = cur_ptr;
-//                 if (cur_ptr >= line_end_ptr)
-//                     goto endfield;
-//                 c = *cur_ptr++;
-//                 /* unquoted field delimiter */
-//                 if (c == delimc)
-//                 {
-//                     found_delim = true;
-//                     goto endfield;
-//                 }
-//                 /* start of quoted field (or part of field) */
-//                 if (c == quotec)
-//                 {
-//                     saw_quote = true;
-//                     break;
-//                 }
-//                 /* Add c to output string */
-//                 *output_ptr++ = c;
-//             }
-//
-//             /* In quote */
-//             for (;;)
-//             {
-//                 end_ptr = cur_ptr;
-//                 if (cur_ptr >= line_end_ptr)
-//                     ereport(ERROR,
-//                             (errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
-//                              errmsg("unterminated CSV quoted field")));
-//
-//                 c = *cur_ptr++;
-//
-//                 /* escape within a quoted field */
-//                 if (c == escapec)
-//                 {
-//                     /*
-//                      * peek at the next char if available, and escape it if it
-//                      * is an escape char or a quote char
-//                      */
-//                     if (cur_ptr < line_end_ptr)
-//                     {
-//                         char        nextc = *cur_ptr;
-//
-//                         if (nextc == escapec || nextc == quotec)
-//                         {
-//                             *output_ptr++ = nextc;
-//                             cur_ptr++;
-//                             continue;
-//                         }
-//                     }
-//                 }
-//
-//                 /*
-//                  * end of quoted field. Must do this test after testing for
-//                  * escape in case quote char and escape char are the same
-//                  * (which is the common case).
-//                  */
-//                 if (c == quotec)
-//                     break;
-//
-//                 /* Add c to output string */
-//                 *output_ptr++ = c;
-//             }
-//         }
-// endfield:
-//
-//         /* Terminate attribute value in output area */
-//         *output_ptr++ = '\0';
-//
-//         /* Check whether raw input matched null marker */
-//         input_len = end_ptr - start_ptr;
-//         if (!saw_quote && input_len == cstate->null_print_len &&
-//             strncmp(start_ptr, cstate->null_print, input_len) == 0)
-//             cstate->raw_fields[fieldno] = NULL;
-//
-//         fieldno++;
-//         /* Done if we hit EOL instead of a delim */
-//         if (!found_delim)
-//             break;
-//     }
-//
-//     /* Clean up state of attribute_buf */
-//     output_ptr--;
-//     Assert(*output_ptr == '\0');
-//     cstate->attribute_buf.len = (output_ptr - cstate->attribute_buf.data);
-//
-//     return fieldno;
-// }
-//
-// /*
-//  *
-//  */
-// bool
-// CopyFromReadAttributes(char *line, bool csv_mode, char ***fields, int *nfields)
-// {
-//     int fldct;
-//
-//     /* Parse the line into de-escaped field values */
-//     if (csv_mode)
-//         fldct = CopyReadCSVAttrs(cstate);
-//     else
-//         fldct = CopyReadTextAttrs(cstate);
-//
-//     *fields = cstate->raw_fields;
-//     *nfields = fldct;
-//     return true;
-// }
 
 /*
  * Parallel Copy FROM file to relation.
@@ -6256,36 +6148,13 @@ ParallelCopyFrom(CopyState cstate, ParseState *pstate,
     shm_mq_handle **mq_handles;
     shm_mq_result   shmq_res;
     int             last_worker_used = 0;
-    // int64           message = 0;
-    // char           *message;
-    // char           *message_contents = VARDATA_ANY(message);
-    // int             message_size = VARSIZE_ANY_EXHDR(message);
     int             message_size = sizeof(char);
 
     mq_handles = palloc0(sizeof(shm_mq_handle *) * nworkers);
 
     MemoryContext oldcontext = CurrentMemoryContext;
 
-    // TupleDesc    tupDesc;
-    // ResultRelInfo *resultRelInfo;
-    // EState       *estate = CreateExecutorState(); /* for ExecConstraints() */
-    // ExprContext *econtext;
-    // TupleTableSlot *myslot;
-    //
-    // ErrorContextCallback errcallback;
-    // CommandId    mycid = GetCurrentCommandId(true);
-    // int            hi_options = 0; /* start with default heap_insert options */
-    // BulkInsertState bistate;
-    // bool        useHeapMultiInsert;
-
-    // ResultRelInfo *saved_resultRelInfo = NULL;
-    // int            prev_leaf_part_index = -1;
     uint64        processed = 0;
-    // int            nBufferedTuples = 0;
-// #define MAX_BUFFERED_TUPLES 1000
-//     HeapTuple  *bufferedTuples = NULL;    /* initialize to silence warning */
-//     Size        bufferedTuplesSize = 0;
-//     int            firstBufferedLineNo = 0;
 
     // MQ size = 100 messages x 80 chars each
     pst = setup_parallel_copy_from(message_size * 80 * queue_size,
@@ -6297,45 +6166,13 @@ ParallelCopyFrom(CopyState cstate, ParseState *pstate,
         attnamelist,
         options);
 
-    // // BG Worker startup
-    // RegisterDynamicBackgroundWorker(&worker, &bgwhandle);
-    // bgwstatus = WaitForBackgroundWorkerStartup(bgwhandle, &bgwpid);
-    // elog(LOG, "Main COPY process (pid %d): BGWorker started (pid %d)", MyProcPid, bgwpid);
-    // // BG Worker startup
-
     elog(LOG, "Copying from file %s", cstate->filename);
 
 	for (;;)
 	{
-        // TupleTableSlot *slot;
-        // bool        skip_tuple;
-        // Oid            loaded_oid = InvalidOid;
-        //         int         next_cf_state; /* NextCopyFrom return state */
         bool done;
 
 		CHECK_FOR_INTERRUPTS();
-
-        // if (nBufferedTuples == 0)
-        // {
-        //     /*
-        //      * Reset the per-tuple exprcontext. We can only do this if the
-        //      * tuple buffer is empty. (Calling the context the per-tuple
-        //      * memory context is a bit of a misnomer now.)
-        //      */
-        //     ResetPerTupleExprContext(estate);
-        // }
-
-		/* Switch into its memory context */
-        // MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-
-        // next_cf_state = NextCopyFrom(cstate, econtext, values, nulls, &loaded_oid);
-
-
-        // LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
-        // // SpinLockAcquire(&pst->mutex);
-        // pst->curr_line++;
-        // // SpinLockRelease(&pst->mutex);
-        // LWLockRelease(CopyFromBgwLock);
 
     	/* on input just throw the header line away */
     	if (cstate->cur_lineno == 0 && cstate->header_line)
@@ -6349,7 +6186,8 @@ ParallelCopyFrom(CopyState cstate, ParseState *pstate,
 
     	/* Actually read the line into memory here */
     	done = CopyReadLine(cstate);
-        // elog(LOG, "Reading line #%d with status %d", cstate->cur_lineno, done);
+        // Sleep 1 second, to be sure, that BGWorkers consume lines, when master is still working.
+        // sleep(1);
 
     	/*
     	 * EOF at start of line means we're done.  If we see EOF after some
@@ -6373,15 +6211,8 @@ ParallelCopyFrom(CopyState cstate, ParseState *pstate,
         }
         else
         {
-            // message = pst->curr_line;
-            // cur_ptr = cstate->line_buf.data;
-            // line_end_ptr = cstate->line_buf.data + cstate->line_buf.len;
-            // message = (char *) palloc(cstate->line_buf.len);
-            // memcpy(message, cstate->line_buf.data, cstate->line_buf.len);
-            // shmq_res = shm_mq_send(mq_handles[++last_worker_used - 1], message_size, &message, false);
-            // elog(LOG, "Sending line #%d '%s' to BGWorker #%d", cstate->cur_lineno, message, last_worker_used + 1);
             elog(LOG, "Sending line #%d to BGWorker #%d", cstate->cur_lineno, last_worker_used + 1);
-            // shmq_res = shm_mq_send(mq_handles[++last_worker_used - 1], cstate->line_buf.len, message, false);
+
             shmq_res = shm_mq_send(mq_handles[++last_worker_used - 1], cstate->line_buf.len, cstate->line_buf.data, false);
             if (shmq_res != SHM_MQ_SUCCESS)
                 ereport(ERROR,
@@ -6390,323 +6221,21 @@ ParallelCopyFrom(CopyState cstate, ParseState *pstate,
             if (last_worker_used == nworkers)
                 last_worker_used = 0;
         }
-
-    //     if (!next_cf_state) {
-    //         break;
-    //     }
-    //         else if (next_cf_state == NCF_SUCCESS)
-    //         {
-    //             /* And now we can form the input tuple. */
-    //             tuple = heap_form_tuple(tupDesc, values, nulls);
-    //
-    //             if (loaded_oid != InvalidOid)
-    //                 HeapTupleSetOid(tuple, loaded_oid);
-    //
-    //             /*
-    //              * Constraints might reference the tableoid column, so initialize
-    //              * t_tableOid before evaluating them.
-    //              */
-    //             tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-    //
-    //             /* Triggers and stuff need to be invoked in query context. */
-    //             MemoryContextSwitchTo(oldcontext);
-    //
-    //             /* Place tuple in tuple slot --- but slot shouldn't free it */
-    //             slot = myslot;
-    //             ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-    //
-    //             /* Determine the partition to heap_insert the tuple into */
-    //             if (cstate->partition_dispatch_info)
-    //             {
-    //                 int            leaf_part_index;
-    //                 TupleConversionMap *map;
-    //
-    //                 /*
-    //                  * Away we go ... If we end up not finding a partition after all,
-    //                  * ExecFindPartition() does not return and errors out instead.
-    //                  * Otherwise, the returned value is to be used as an index into
-    //                  * arrays mt_partitions[] and mt_partition_tupconv_maps[] that
-    //                  * will get us the ResultRelInfo and TupleConversionMap for the
-    //                  * partition, respectively.
-    //                  */
-    //                 leaf_part_index = ExecFindPartition(resultRelInfo,
-    //                                                     cstate->partition_dispatch_info,
-    //                                                     slot,
-    //                                                     estate);
-    //                 Assert(leaf_part_index >= 0 &&
-    //                        leaf_part_index < cstate->num_partitions);
-    //
-    //                 /*
-    //                  * If this tuple is mapped to a partition that is not same as the
-    //                  * previous one, we'd better make the bulk insert mechanism gets a
-    //                  * new buffer.
-    //                  */
-    //                 if (prev_leaf_part_index != leaf_part_index)
-    //                 {
-    //                     ReleaseBulkInsertStatePin(bistate);
-    //                     prev_leaf_part_index = leaf_part_index;
-    //                 }
-    //
-    //                 /*
-    //                  * Save the old ResultRelInfo and switch to the one corresponding
-    //                  * to the selected partition.
-    //                  */
-    //                 saved_resultRelInfo = resultRelInfo;
-    //                 resultRelInfo = cstate->partitions + leaf_part_index;
-    //
-    //                 /* We do not yet have a way to insert into a foreign partition */
-    //                 if (resultRelInfo->ri_FdwRoutine)
-    //                     ereport(ERROR,
-    //                             (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-    //                              errmsg("cannot route inserted tuples to a foreign table")));
-    //
-    //                 /*
-    //                  * For ExecInsertIndexTuples() to work on the partition's indexes
-    //                  */
-    //                 estate->es_result_relation_info = resultRelInfo;
-    //
-    //                 /*
-    //                  * If we're capturing transition tuples, we might need to convert
-    //                  * from the partition rowtype to parent rowtype.
-    //                  */
-    //                 if (cstate->transition_capture != NULL)
-    //                 {
-    //                     if (resultRelInfo->ri_TrigDesc &&
-    //                         (resultRelInfo->ri_TrigDesc->trig_insert_before_row ||
-    //                          resultRelInfo->ri_TrigDesc->trig_insert_instead_row))
-    //                     {
-    //                         /*
-    //                          * If there are any BEFORE or INSTEAD triggers on the
-    //                          * partition, we'll have to be ready to convert their
-    //                          * result back to tuplestore format.
-    //                          */
-    //                         cstate->transition_capture->tcs_original_insert_tuple = NULL;
-    //                         cstate->transition_capture->tcs_map =
-    //                             cstate->transition_tupconv_maps[leaf_part_index];
-    //                     }
-    //                     else
-    //                     {
-    //                         /*
-    //                          * Otherwise, just remember the original unconverted
-    //                          * tuple, to avoid a needless round trip conversion.
-    //                          */
-    //                         cstate->transition_capture->tcs_original_insert_tuple = tuple;
-    //                         cstate->transition_capture->tcs_map = NULL;
-    //                     }
-    //                 }
-    //                 /*
-    //                  * We might need to convert from the parent rowtype to the
-    //                  * partition rowtype.
-    //                  */
-    //                 map = cstate->partition_tupconv_maps[leaf_part_index];
-    //                 if (map)
-    //                 {
-    //                     Relation    partrel = resultRelInfo->ri_RelationDesc;
-    //
-    //                     tuple = do_convert_tuple(tuple, map);
-    //
-    //                     /*
-    //                      * We must use the partition's tuple descriptor from this
-    //                      * point on.  Use a dedicated slot from this point on until
-    //                      * we're finished dealing with the partition.
-    //                      */
-    //                     slot = cstate->partition_tuple_slot;
-    //                     Assert(slot != NULL);
-    //                     ExecSetSlotDescriptor(slot, RelationGetDescr(partrel));
-    //                     ExecStoreTuple(tuple, slot, InvalidBuffer, true);
-    //                 }
-    //
-    //                 tuple->t_tableOid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
-    //             }
-    //
-    //             skip_tuple = false;
-    //
-    //             /* BEFORE ROW INSERT Triggers */
-    //             if (resultRelInfo->ri_TrigDesc &&
-    //                 resultRelInfo->ri_TrigDesc->trig_insert_before_row)
-    //             {
-    //                 slot = ExecBRInsertTriggers(estate, resultRelInfo, slot);
-    //
-    //                 if (slot == NULL)    /* "do nothing" */
-    //                     skip_tuple = true;
-    //                 else                /* trigger might have changed tuple */
-    //                     tuple = ExecMaterializeSlot(slot);
-    //             }
-    //         }
-    //         else
-    //         {
-    //             skip_tuple = true;
-    //         }
-    //
-    //     if (!skip_tuple)
-    //     {
-    //         if (resultRelInfo->ri_TrigDesc &&
-    //             resultRelInfo->ri_TrigDesc->trig_insert_instead_row)
-    //         {
-    //             /* Pass the data to the INSTEAD ROW INSERT trigger */
-    //             ExecIRInsertTriggers(estate, resultRelInfo, slot);
-    //         }
-    //         else
-    //         {
-    //             /*
-    //              * We always check the partition constraint, including when
-    //              * the tuple got here via tuple-routing.  However we don't
-    //              * need to in the latter case if no BR trigger is defined on
-    //              * the partition.  Note that a BR trigger might modify the
-    //              * tuple such that the partition constraint is no longer
-    //              * satisfied, so we need to check in that case.
-    //              */
-    //             bool        check_partition_constr =
-    //             (resultRelInfo->ri_PartitionCheck != NIL);
-    //
-    //             if (saved_resultRelInfo != NULL &&
-    //                 !(resultRelInfo->ri_TrigDesc &&
-    //                   resultRelInfo->ri_TrigDesc->trig_insert_before_row))
-    //                 check_partition_constr = false;
-    //
-    //             /* Check the constraints of the tuple */
-    //             if (cstate->rel->rd_att->constr || check_partition_constr)
-    //                 ExecConstraints(resultRelInfo, slot, estate);
-    //
-    //             if (useHeapMultiInsert)
-    //             {
-    //                 /* Add this tuple to the tuple buffer */
-    //                 if (nBufferedTuples == 0)
-    //                     firstBufferedLineNo = cstate->cur_lineno;
-    //                 bufferedTuples[nBufferedTuples++] = tuple;
-    //                 bufferedTuplesSize += tuple->t_len;
-    //
-    //                 /*
-    //                  * If the buffer filled up, flush it.  Also flush if the
-    //                  * total size of all the tuples in the buffer becomes
-    //                  * large, to avoid using large amounts of memory for the
-    //                  * buffer when the tuples are exceptionally wide.
-    //                  */
-    //                 if (nBufferedTuples == MAX_BUFFERED_TUPLES ||
-    //                     bufferedTuplesSize > 65535)
-    //                 {
-    //                     CopyFromInsertBatch(cstate, estate, mycid, hi_options,
-    //                                         resultRelInfo, myslot, bistate,
-    //                                         nBufferedTuples, bufferedTuples,
-    //                                         firstBufferedLineNo);
-    //                     nBufferedTuples = 0;
-    //                     bufferedTuplesSize = 0;
-    //                 }
-    //             }
-    //             else
-    //             {
-    //                 List       *recheckIndexes = NIL;
-    //
-    //                 /* OK, store the tuple and create index entries for it */
-    //                 heap_insert(resultRelInfo->ri_RelationDesc, tuple, mycid,
-    //                             hi_options, bistate);
-    //
-    //                 if (resultRelInfo->ri_NumIndices > 0)
-    //                     recheckIndexes = ExecInsertIndexTuples(slot,
-    //                                                            &(tuple->t_self),
-    //                                                            estate,
-    //                                                            false,
-    //                                                            NULL,
-    //                                                            NIL);
-    //
-    //                 /* AFTER ROW INSERT Triggers */
-    //                 ExecARInsertTriggers(estate, resultRelInfo, tuple,
-    //                                      recheckIndexes, cstate->transition_capture);
-    //
-    //                 list_free(recheckIndexes);
-    //             }
-    //         }
-    //
-    //         /*
-    //          * We count only tuples not suppressed by a BEFORE INSERT trigger;
-    //          * this is the same definition used by execMain.c for counting
-    //          * tuples inserted by an INSERT command.
-    //          */
-    //         processed++;
-    //
-    //         if (saved_resultRelInfo)
-    //         {
-    //             resultRelInfo = saved_resultRelInfo;
-    //             estate->es_result_relation_info = resultRelInfo;
-    //         }
-    //     }
     }
-    //
-    // /* Flush any remaining buffered tuples */
-    // if (nBufferedTuples > 0)
-    //     CopyFromInsertBatch(cstate, estate, mycid, hi_options,
-    //                         resultRelInfo, myslot, bistate,
-    //                         nBufferedTuples, bufferedTuples,
-    //                         firstBufferedLineNo);
-    //
-    // /* Done, clean up */
-    // error_context_stack = errcallback.previous;
-    //
-    // FreeBulkInsertState(bistate);
 
     /* Wait for all workers to complete their work. */
     wait_for_workers_to_finish(pst);
 
+    // /* Wait to be signalled. */
+    // WaitLatch(MyLatch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
+    // /* Reset the latch so we don't spin. */
+    // ResetLatch(MyLatch);
+
+    LWLockAcquire(CopyFromBgwLock, LW_EXCLUSIVE);
+    processed = pst->processed;
+    LWLockRelease(CopyFromBgwLock);
+
 	MemoryContextSwitchTo(oldcontext);
-
-	/*
-	 * In the old protocol, tell pqcomm that we can process normal protocol
-	 * messages again.
-	 */
-	if (cstate->copy_dest == COPY_OLD_FE)
-		pq_endmsgread();
-
-	/* Execute AFTER STATEMENT insertion triggers */
-	ExecASInsertTriggers(pst->estate, pst->resultRelInfo, cstate->transition_capture);
-
-	/* Handle queued AFTER triggers */
-	AfterTriggerEndQuery(pst->estate);
-
-	ExecResetTupleTable(pst->estate->es_tupleTable, false);
-
-	ExecCloseIndices(pst->resultRelInfo);
-
-	/* Close all the partitioned tables, leaf partitions, and their indices */
-	if (cstate->partition_dispatch_info)
-	{
-		int			i;
-
-		/*
-		 * Remember cstate->partition_dispatch_info[0] corresponds to the root
-		 * partitioned table, which we must not try to close, because it is
-		 * the main target table of COPY that will be closed eventually by
-		 * DoCopy().  Also, tupslot is NULL for the root partitioned table.
-		 */
-		for (i = 1; i < cstate->num_dispatch; i++)
-		{
-			PartitionDispatch pd = cstate->partition_dispatch_info[i];
-
-			heap_close(pd->reldesc, NoLock);
-			ExecDropSingleTupleTableSlot(pd->tupslot);
-		}
-		for (i = 0; i < cstate->num_partitions; i++)
-		{
-			ResultRelInfo *resultRelInfo = cstate->partitions + i;
-
-			ExecCloseIndices(resultRelInfo);
-			heap_close(resultRelInfo->ri_RelationDesc, NoLock);
-		}
-
-		/* Release the standalone partition tuple descriptor */
-		ExecDropSingleTupleTableSlot(cstate->partition_tuple_slot);
-	}
-
-	/* Close any trigger target relations */
-	ExecCleanUpTriggerState(pst->estate);
-
-	FreeExecutorState(pst->estate);
-
-	/*
-	 * If we skipped writing WAL, then we need to sync the heap (but not
-	 * indexes since those use WAL anyway)
-	 */
-	if (pst->hi_options & HEAP_INSERT_SKIP_WAL)
-		heap_sync(cstate->rel);
 
     /* Clean up. */
     dsm_detach(seg);
