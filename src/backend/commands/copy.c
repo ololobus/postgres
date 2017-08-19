@@ -407,8 +407,8 @@ static void setup_dsm(int64 queue_size, int nworkers,
 static WorkerState *setup_background_workers(int nworkers,
                                              dsm_segment *seg);
 static void cleanup_background_workers(dsm_segment *seg, Datum arg);
-static void wait_for_workers_to_become_ready(WorkerState *wstate,
-                                             volatile ParallelState *pst);
+static void wait_for_workers(WorkerState *wstate,
+                    volatile ParallelState *pst);
 static bool check_worker_status(WorkerState *wstate);
 
 static void handle_sigterm(SIGNAL_ARGS);
@@ -1479,8 +1479,6 @@ BeginCopy(ParseState *pstate,
 
 	/* Allocate workspace and zero all fields */
 	cstate = (CopyStateData *) palloc0(sizeof(CopyStateData));
-
-    cstate->allow_parallel = IsNormalProcessingMode() && IsUnderPostmaster;
 
 	/*
 	 * We allocate everything used by a cstate in a new memory context. This
@@ -3090,6 +3088,10 @@ BeginCopyFrom(ParseState *pstate,
 	cstate->cur_lineno = 0;
 	cstate->cur_attname = NULL;
 	cstate->cur_attval = NULL;
+
+    cstate->allow_parallel = IsNormalProcessingMode()
+                          && IsUnderPostmaster
+                          && !rel->rd_islocaltemp;
 
 	/* Set up variables to avoid per-attribute overhead. */
 	initStringInfo(&cstate->attribute_buf);
@@ -5827,7 +5829,7 @@ setup_parallel_copy_from(int64 queue_size, int32 nworkers, dsm_segment **segp,
     }
 
     /* Wait for workers to become ready. */
-    wait_for_workers_to_become_ready(wstate, pst);
+    wait_for_workers(wstate, pst);
     /* Wait to be signalled. */
     // WaitLatch(MyLatch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
     /* Reset the latch so we don't spin. */
@@ -6033,7 +6035,7 @@ cleanup_background_workers(dsm_segment *seg, Datum arg)
 }
 
 static void
-wait_for_workers_to_become_ready(WorkerState *wstate,
+wait_for_workers(WorkerState *wstate,
                                  volatile ParallelState *pst)
 {
     bool result = false;
@@ -6154,11 +6156,11 @@ ParallelCopyFrom(CopyState cstate, ParseState *pstate,
     ParallelState  *pst;
     dsm_segment    *seg;
     int32           nworkers = max_parallel_workers_per_gather;
-    int64           queue_size = 100000;
     shm_mq_handle **mq_handles;
     shm_mq_result   shmq_res;
     int             last_worker_used = 0;
-    int             message_size = sizeof(char) * 80;
+    int             message_size = sizeof(char) * 80; // 80 chars each
+    int64           queue_size = 100000; // Number of messages in MQ
 
     mq_handles = palloc0(sizeof(shm_mq_handle *) * nworkers);
 
@@ -6166,7 +6168,6 @@ ParallelCopyFrom(CopyState cstate, ParseState *pstate,
 
     uint64        processed = 0;
 
-    // MQ size = 100 messages x 80 chars each
     pst = setup_parallel_copy_from(message_size * queue_size,
         nworkers,
         &seg,
