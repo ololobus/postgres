@@ -237,8 +237,6 @@ typedef struct CopyStateData
 	char	   *raw_buf;
 	int			raw_buf_index;	/* next byte to process */
 	int			raw_buf_len;	/* total # of bytes stored */
-
-    bool        allow_parallel;
 } CopyStateData;
 
 /* DestReceiver for COPY (query) TO */
@@ -392,18 +390,13 @@ static bool CopyGetInt16(CopyState cstate, int16 *val);
 
 
 static ParallelState* setup_parallel_copy_from(int64 queue_size, int32 nworkers,
-                                   dsm_segment **segp, shm_mq_handle **mq_handles[], CopyState cstate,
-                                   ParseState *pstate,
-                                   List *attnamelist,
-                                   List *options);
+                                   dsm_segment **segp, shm_mq_handle **mq_handles[],
+                                   const char *query_string);
 static void setup_dsm(int64 queue_size, int nworkers,
                                         dsm_segment **segp,
                                         ParallelState **pstp,
                                         shm_mq **mqs[],
-                                        CopyState cstate,
-                                        ParseState *pstate,
-                                        List *attnamelist,
-                                        List *options);
+                                        const char *query_string);
 static WorkerState *setup_background_workers(int nworkers,
                                              dsm_segment *seg);
 static void cleanup_background_workers(dsm_segment *seg, Datum arg);
@@ -855,7 +848,8 @@ CopyLoadRawBuf(CopyState cstate)
 void
 DoCopy(ParseState *pstate, const CopyStmt *stmt,
 	   int stmt_location, int stmt_len,
-	   uint64 *processed)
+	   uint64 *processed, const char *query_string,
+       bool is_top_level)
 {
 	CopyState	cstate;
 	bool		is_from = stmt->is_from;
@@ -1038,6 +1032,11 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 
 	if (is_from)
 	{
+        bool allow_parallel = IsNormalProcessingMode()
+                           && IsUnderPostmaster
+                           && !rel->rd_islocaltemp
+                           && is_top_level;
+
 		Assert(rel);
 
 		/* check read-only transaction and parallel mode */
@@ -1048,11 +1047,9 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 		cstate = BeginCopyFrom(pstate, rel, stmt->filename, stmt->is_program,
 							   NULL, stmt->attlist, stmt->options);
 
-        if (cstate->allow_parallel)    /* copy from file to database */
-        // if (false)
+        if (allow_parallel)    /* copy from file to database */
         {
-    		*processed = ParallelCopyFrom(cstate, pstate, rel, stmt->filename, stmt->is_program,
-							              stmt->attlist, stmt->options);
+    		*processed = ParallelCopyFrom(cstate, query_string);
         }
         else
         {
@@ -3088,10 +3085,6 @@ BeginCopyFrom(ParseState *pstate,
 	cstate->cur_lineno = 0;
 	cstate->cur_attname = NULL;
 	cstate->cur_attval = NULL;
-
-    cstate->allow_parallel = IsNormalProcessingMode()
-                          && IsUnderPostmaster
-                          && !rel->rd_islocaltemp;
 
 	/* Set up variables to avoid per-attribute overhead. */
 	initStringInfo(&cstate->attribute_buf);
@@ -5133,6 +5126,10 @@ CopyFromBgwMainLoop(Datum main_arg)
     BackgroundWorkerInitializeConnectionByOid(pst->database_id,
                                               pst->authenticated_user_id);
 
+    StartTransactionCommand();
+
+    PushActiveSnapshot(GetTransactionSnapshot());
+
     /*
      * Set the client encoding to the database encoding, since that is what
      * the leader will expect.
@@ -5151,7 +5148,7 @@ CopyFromBgwMainLoop(Datum main_arg)
     pstmt = lfirst_node(PlannedStmt, list_head(plantree_list));
     cstmnt = (CopyStmt *) pstmt->utilityStmt;
 
-    elog(LOG, "BGWorker #%d filename from CopyStmt: %s", myworkernumber, cstmnt->filename);
+    // elog(LOG, "BGWorker #%d filename from CopyStmt: %s", myworkernumber, cstmnt->filename);
 
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = query_string;
@@ -5186,14 +5183,14 @@ CopyFromBgwMainLoop(Datum main_arg)
     registrant = BackendPidGetProc(MyBgworkerEntry->bgw_notify_pid);
     SetLatch(&registrant->procLatch);
 
-    StartTransactionCommand();
-
     /* Open and lock the relation, using the appropriate lock type. */
 	rel = heap_openrv(cstmnt->relation, RowExclusiveLock);
                       // (is_from ? RowExclusiveLock : AccessShareLock));
 
     cstate = BeginCopyFrom(pstate, rel, cstmnt->filename, cstmnt->is_program,
 							   NULL, cstmnt->attlist, cstmnt->options);
+
+	Assert(cstate->rel);
 
     estate = CreateExecutorState(); /* for ExecConstraints() */
     mycid = GetCurrentCommandId(true);
@@ -5799,10 +5796,7 @@ handle_sigterm(SIGNAL_ARGS)
  */
 static ParallelState*
 setup_parallel_copy_from(int64 queue_size, int32 nworkers, dsm_segment **segp,
-                  shm_mq_handle ***mq_handles, CopyState cstate,
-                  ParseState *pstate,
-                  List *attnamelist,
-                  List *options)
+                  shm_mq_handle ***mq_handles, const char *query_string)
 {
     int             i;
     dsm_segment     *seg;
@@ -5813,10 +5807,7 @@ setup_parallel_copy_from(int64 queue_size, int32 nworkers, dsm_segment **segp,
     mqs = palloc0(sizeof(shm_mq *) * nworkers);
 
     /* Set up a dynamic shared memory segment. */
-    setup_dsm(queue_size, nworkers, &seg, &pst, &mqs, cstate,
-            pstate,
-            attnamelist,
-            options);
+    setup_dsm(queue_size, nworkers, &seg, &pst, &mqs, query_string);
     *segp = seg;
 
     /* Register background workers. */
@@ -5857,10 +5848,7 @@ setup_parallel_copy_from(int64 queue_size, int32 nworkers, dsm_segment **segp,
 static void
 setup_dsm(int64 queue_size, int nworkers,
                             dsm_segment **segp, ParallelState **pstp,
-                            shm_mq ***mqs, CopyState cstate,
-                            ParseState *pstate,
-                            List *attnamelist,
-                            List *options)
+                            shm_mq ***mqs, const char *query_string)
 {
     shm_toc_estimator e;
     int               i;
@@ -5870,8 +5858,6 @@ setup_dsm(int64 queue_size, int nworkers,
     shm_toc          *toc;
     ParallelState    *pst;
     char             *shm_query;
-
-	Assert(cstate->rel);
 
     /* Ensure a valid queue size. */
     if (queue_size < 0 || ((uint64) queue_size) < shm_mq_minimum_size)
@@ -5896,7 +5882,7 @@ setup_dsm(int64 queue_size, int nworkers,
     shm_toc_initialize_estimator(&e);
     shm_toc_estimate_chunk(&e, sizeof(ParallelState));
 
-    shm_toc_estimate_chunk(&e, strlen(ActivePortal->sourceText) * sizeof(char));
+    shm_toc_estimate_chunk(&e, strlen(query_string) * sizeof(char));
 
     for (i = 0; i < nworkers; ++i)
         shm_toc_estimate_chunk(&e, (Size) queue_size);
@@ -5925,7 +5911,7 @@ setup_dsm(int64 queue_size, int nworkers,
 
     shm_query    = shm_toc_allocate(toc, strlen(ActivePortal->sourceText) * sizeof(char));
 
-    strcpy(shm_query, ActivePortal->sourceText);
+    strcpy(shm_query, query_string);
 
     shm_toc_insert(toc, toc_key++, shm_query);
 
@@ -6146,12 +6132,7 @@ wait_for_workers_to_finish(volatile ParallelState *pst)
  * Parallel Copy FROM file to relation.
  */
 extern uint64
-ParallelCopyFrom(CopyState cstate, ParseState *pstate,
-			  Relation rel,
-			  const char *filename,
-			  bool is_program,
-			  List *attnamelist,
-			  List *options)
+ParallelCopyFrom(CopyState cstate, const char *query_string)
 {
     ParallelState  *pst;
     dsm_segment    *seg;
@@ -6172,10 +6153,7 @@ ParallelCopyFrom(CopyState cstate, ParseState *pstate,
         nworkers,
         &seg,
         &mq_handles,
-        cstate,
-        pstate,
-        attnamelist,
-        options);
+        query_string);
 
     elog(LOG, "Copying from file %s", cstate->filename);
 
