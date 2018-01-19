@@ -48,6 +48,8 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 
 	int32		subworkmem;		/* Memory to use to decode changes. */
 
+	bool		substream;		/* Stream in-progress transactions. */
+
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* Connection string to the publisher */
 	text		subconninfo BKI_FORCE_NOT_NULL;
@@ -69,16 +71,17 @@ typedef FormData_pg_subscription *Form_pg_subscription;
  *		compiler constants for pg_subscription
  * ----------------
  */
-#define Natts_pg_subscription					9
+#define Natts_pg_subscription					10
 #define Anum_pg_subscription_subdbid			1
 #define Anum_pg_subscription_subname			2
 #define Anum_pg_subscription_subowner			3
 #define Anum_pg_subscription_subenabled			4
 #define Anum_pg_subscription_subworkmem			5
-#define Anum_pg_subscription_subconninfo		6
-#define Anum_pg_subscription_subslotname		7
-#define Anum_pg_subscription_subsynccommit		8
-#define Anum_pg_subscription_subpublications	9
+#define Anum_pg_subscription_substream			6
+#define Anum_pg_subscription_subconninfo		7
+#define Anum_pg_subscription_subslotname		8
+#define Anum_pg_subscription_subsynccommit		9
+#define Anum_pg_subscription_subpublications	10
 
 
 typedef struct Subscription
@@ -90,6 +93,7 @@ typedef struct Subscription
 	Oid			owner;			/* Oid of the subscription owner */
 	bool		enabled;		/* Indicates if the subscription is enabled */
 	int			workmem;		/* Memory to decode changes. */
+	bool		stream;			/* Allow streaming in-progress transactions. */
 	char	   *conninfo;		/* Connection string to the publisher */
 	char	   *slotname;		/* Name of the replication slot */
 	char	   *synccommit;		/* Synchronous commit setting for worker */
