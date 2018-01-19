@@ -369,9 +369,28 @@ pgoutput_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
  */
 static void
 maybe_send_schema(LogicalDecodingContext *ctx,
-				  Relation relation, RelationSyncEntry *relentry)
+				  Relation relation, RelationSyncEntry *relentry,
+				  ReorderBufferChange *change)
 {
 	bool schema_sent;
+	TransactionId xid = InvalidTransactionId;
+	TransactionId topxid = InvalidTransactionId;
+
+	/*
+	 * Remember XID of the (sub)transaction for the change. We don't care if
+	 * it's top-level transaction or not (we have already sent that XID in
+	 * start the current streaming block).
+	 *
+	 * If we're not in a streaming block, just use InvalidTransactionId and
+	 * the write methods will not include it.
+	 */
+	if (in_streaming)
+		xid = change->txn->xid;
+	
+	if (change->txn->toptxn)
+		topxid = change->txn->toptxn->xid;
+	else
+		topxid = xid;
 
 	/*
 	 * Do we need to send the schema? We do track streamed transactions
@@ -384,7 +403,7 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 	else
 		schema_sent = relentry->schema_sent;
 
-	if (!relentry->schema_sent)
+	if (!schema_sent)
 	{
 		TupleDesc	desc;
 		int			i;
@@ -406,12 +425,12 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 				continue;
 
 			OutputPluginPrepareWrite(ctx, false);
-			logicalrep_write_typ(ctx->out, att->atttypid);
+			logicalrep_write_typ(ctx->out, xid, att->atttypid);
 			OutputPluginWrite(ctx, false);
 		}
 
 		OutputPluginPrepareWrite(ctx, false);
-		logicalrep_write_rel(ctx->out, relation);
+		logicalrep_write_rel(ctx->out, xid, relation);
 		OutputPluginWrite(ctx, false);
 		relentry->xid = change->txn->xid;
 
@@ -431,12 +450,10 @@ static void
 pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 				Relation relation, ReorderBufferChange *change)
 {
-	bool schema_sent;
 	PGOutputData *data = (PGOutputData *) ctx->output_plugin_private;
 	MemoryContext old;
 	RelationSyncEntry *relentry;
 	TransactionId xid = InvalidTransactionId;
-	TransactionId topxid = InvalidTransactionId;
 
 	/*
 	 * Remember XID of the (sub)transaction for the change. We don't care if
@@ -448,11 +465,6 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	 */
 	if (in_streaming)
 		xid = change->txn->xid;
-
-	if (change->txn->toptxn)
-		topxid = change->txn->toptxn->xid;
-	else
-		topxid = xid;
 
 	if (!is_publishable_relation(relation))
 		return;
@@ -481,7 +493,7 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	/* Avoid leaking memory by using and resetting our own context */
 	old = MemoryContextSwitchTo(data->context);
 
-	maybe_send_schema(ctx, relation, relentry);
+	maybe_send_schema(ctx, relation, relentry, change);
 
 	/* Send the data */
 	switch (change->action)
@@ -553,7 +565,7 @@ pgoutput_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			continue;
 
 		relids[nrelids++] = relid;
-		maybe_send_schema(ctx, relation, relentry);
+		maybe_send_schema(ctx, relation, relentry, change);
 	}
 
 	if (nrelids > 0)
