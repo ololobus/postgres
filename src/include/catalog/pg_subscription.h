@@ -46,6 +46,8 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 	bool		subenabled;		/* True if the subscription is enabled (the
 								 * worker should be running) */
 
+	int32		subworkmem;		/* Memory to use to decode changes. */
+
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* Connection string to the publisher */
 	text		subconninfo BKI_FORCE_NOT_NULL;
@@ -63,6 +65,22 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 
 typedef FormData_pg_subscription *Form_pg_subscription;
 
+/* ----------------
+ *		compiler constants for pg_subscription
+ * ----------------
+ */
+#define Natts_pg_subscription					9
+#define Anum_pg_subscription_subdbid			1
+#define Anum_pg_subscription_subname			2
+#define Anum_pg_subscription_subowner			3
+#define Anum_pg_subscription_subenabled			4
+#define Anum_pg_subscription_subworkmem			5
+#define Anum_pg_subscription_subconninfo		6
+#define Anum_pg_subscription_subslotname		7
+#define Anum_pg_subscription_subsynccommit		8
+#define Anum_pg_subscription_subpublications	9
+
+
 typedef struct Subscription
 {
 	Oid			oid;			/* Oid of the subscription */
@@ -71,6 +89,7 @@ typedef struct Subscription
 	char	   *name;			/* Name of the subscription */
 	Oid			owner;			/* Oid of the subscription owner */
 	bool		enabled;		/* Indicates if the subscription is enabled */
+	int			workmem;		/* Memory to decode changes. */
 	char	   *conninfo;		/* Connection string to the publisher */
 	char	   *slotname;		/* Name of the replication slot */
 	char	   *synccommit;		/* Synchronous commit setting for worker */
