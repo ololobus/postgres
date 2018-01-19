@@ -184,6 +184,11 @@ typedef struct ReorderBufferTXN
 	TransactionId toplevel_xid;
 
 	/*
+	 * Toplevel transaction for this subxact (NULL for top-level).
+	 */
+	struct ReorderBufferTXN *toptxn;
+
+	/*
 	 * LSN of the first data carrying, WAL record with knowledge about this
 	 * xid. This is allowed to *not* be first record adorned with this xid, if
 	 * the previous records aren't relevant for logical decoding.
@@ -236,6 +241,13 @@ typedef struct ReorderBufferTXN
 	dlist_node	base_snapshot_node; /* link in txns_by_base_snapshot_lsn */
 
 	/*
+	 * Snapshot/CID from the previous streaming run. Only valid for already
+	 * streamed transactions (NULL/InvalidCommandId otherwise).
+	 */
+	Snapshot	snapshot_now;
+	CommandId	command_id;
+
+	/*
 	 * How many ReorderBufferChange's do we have in this txn.
 	 *
 	 * Changes in subtransactions are *not* included but tracked separately.
@@ -256,6 +268,12 @@ typedef struct ReorderBufferTXN
 	 * nentries_mem == nentries.
 	 */
 	bool		serialized;
+
+	/*
+	 * Has this transaction been streamed to the remote side?  We never stream
+	 * and serialize a transaction at the same time.
+	 */
+	bool		streamed;
 
 	/*
 	 * List of ReorderBufferChange structs, including new Snapshots and new
