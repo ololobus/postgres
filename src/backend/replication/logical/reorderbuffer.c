@@ -460,6 +460,7 @@ ReorderBufferReturnChange(ReorderBuffer *rb, ReorderBufferChange *change)
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_CONFIRM:
 		case REORDER_BUFFER_CHANGE_INTERNAL_COMMAND_ID:
 		case REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID:
+		case REORDER_BUFFER_CHANGE_INVALIDATION:
 			break;
 	}
 
@@ -1616,6 +1617,18 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 
 					break;
 
+				case REORDER_BUFFER_CHANGE_INVALIDATION:
+
+					/*
+					 * Execute the invalidation message locally.
+					 *
+					 * XXX Do we need to care about relcacheInitFileInval and
+					 * the other fields added to ReorderBufferChange, or just
+					 * about the message itself?
+					 */
+					LocalExecuteInvalidationMessage(&change->data.inval.msg);
+					break;
+
 				case REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID:
 					elog(ERROR, "tuplecid value in changequeue");
 					break;
@@ -1988,6 +2001,38 @@ ReorderBufferAddNewTupleCids(ReorderBuffer *rb, TransactionId xid,
 
 	dlist_push_tail(&txn->tuplecids, &change->node);
 	txn->ntuplecids++;
+}
+
+/*
+ * Setup the invalidation of the toplevel transaction.
+ */
+void
+ReorderBufferAddInvalidation(ReorderBuffer *rb, TransactionId xid,
+							 XLogRecPtr lsn,
+							 Oid dbId, Oid tsId, bool relcacheInitFileInval,
+							 SharedInvalidationMessage msg)
+{
+	MemoryContext oldcontext;
+	ReorderBufferChange *change;
+
+	/* XXX Should we even write invalidations without valid XID? */
+	if (xid == InvalidTransactionId)
+		return;
+
+	Assert(xid != InvalidTransactionId);
+
+	oldcontext = MemoryContextSwitchTo(rb->context);
+
+	change = ReorderBufferGetChange(rb);
+	change->action = REORDER_BUFFER_CHANGE_INVALIDATION;
+	change->data.inval.dbId = dbId;
+	change->data.inval.tsId = tsId;
+	change->data.inval.relcacheInitFileInval = relcacheInitFileInval;
+	change->data.inval.msg = msg;
+
+	ReorderBufferQueueChange(rb, xid, lsn, change);
+
+	MemoryContextSwitchTo(oldcontext);
 }
 
 /*
@@ -2415,6 +2460,7 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_CONFIRM:
 		case REORDER_BUFFER_CHANGE_INTERNAL_COMMAND_ID:
 		case REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID:
+		case REORDER_BUFFER_CHANGE_INVALIDATION:
 			/* ReorderBufferChange contains everything important */
 			break;
 	}
@@ -2503,6 +2549,7 @@ ReorderBufferChangeSize(ReorderBufferChange *change)
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_CONFIRM:
 		case REORDER_BUFFER_CHANGE_INTERNAL_COMMAND_ID:
 		case REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID:
+		case REORDER_BUFFER_CHANGE_INVALIDATION:
 			/* ReorderBufferChange contains everything important */
 			break;
 	}
@@ -2767,6 +2814,7 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 		case REORDER_BUFFER_CHANGE_INTERNAL_SPEC_CONFIRM:
 		case REORDER_BUFFER_CHANGE_INTERNAL_COMMAND_ID:
 		case REORDER_BUFFER_CHANGE_INTERNAL_TUPLECID:
+		case REORDER_BUFFER_CHANGE_INVALIDATION:
 			break;
 	}
 
@@ -2778,8 +2826,8 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 	 * although we don't check the memory limit when restoring the changes in
 	 * this branch (we only do that when initially queueing the changes after
 	 * decoding), because we will release the changes later, and that will
-	 * update the accounting too (subtracting the size from the counters).
-	 * And we don't want to underflow there.
+	 * update the accounting too (subtracting the size from the counters). And
+	 * we don't want to underflow there.
 	 */
 	ReorderBufferChangeMemoryUpdate(rb, change, true);
 }
