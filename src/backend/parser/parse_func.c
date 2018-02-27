@@ -2509,6 +2509,8 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 			break;
 		case EXPR_KIND_CALL_ARGUMENT:
 			err = _("set-returning functions are not allowed in CALL arguments");
+		case EXPR_KIND_PUBLICATION_WHERE:
+			err = _("set-returning functions are not allowed in publication WHERE expressions");
 			break;
 		case EXPR_KIND_COPY_WHERE:
 			err = _("set-returning functions are not allowed in COPY FROM WHERE conditions");
