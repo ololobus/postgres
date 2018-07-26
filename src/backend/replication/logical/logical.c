@@ -763,6 +763,9 @@ abort_cb_wrapper(ReorderBuffer *cache, ReorderBufferTXN *txn,
 	LogicalErrorCallbackState state;
 	ErrorContextCallback errcallback;
 
+	if (!ctx->callbacks.abort_cb)
+		return;
+
 	/* Push callback + info on the error context stack */
 	state.ctx = ctx;
 	state.callback_name = "abort";
