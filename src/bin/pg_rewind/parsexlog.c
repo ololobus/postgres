@@ -45,13 +45,20 @@ static char xlogfpath[MAXPGPATH];
 typedef struct XLogPageReadPrivate
 {
 	const char *datadir;
+	const char *restoreCommand;
 	int			tliIndex;
+	XLogRecPtr  oldrecptr;
+	TimeLineID  oldtli;
 } XLogPageReadPrivate;
 
 static int SimpleXLogPageRead(XLogReaderState *xlogreader,
 				   XLogRecPtr targetPagePtr,
 				   int reqLen, XLogRecPtr targetRecPtr, char *readBuf,
 				   TimeLineID *pageTLI);
+
+static bool RestoreArchivedWAL(const char *path, const char *xlogfname, 
+					const char *restoreCommand,
+					const char *lastRestartPointFname);
 
 /*
  * Read WAL from the datadir/pg_xlog, starting from 'startpoint' on timeline
@@ -60,15 +67,19 @@ static int SimpleXLogPageRead(XLogReaderState *xlogreader,
  */
 void
 extractPageMap(const char *datadir, XLogRecPtr startpoint, int tliIndex,
-			   XLogRecPtr endpoint)
+			   ControlFileData *targetCF, const char *restore_command)
 {
 	XLogRecord *record;
+	XLogRecPtr endpoint = targetCF->checkPoint;
 	XLogReaderState *xlogreader;
 	char	   *errormsg;
 	XLogPageReadPrivate private;
 
 	private.datadir = datadir;
 	private.tliIndex = tliIndex;
+	private.restoreCommand = restore_command;
+	private.oldrecptr = targetCF->checkPointCopy.redo;
+	private.oldtli = targetCF->checkPointCopy.ThisTimeLineID;
 	xlogreader = XLogReaderAllocate(&SimpleXLogPageRead, &private);
 	if (xlogreader == NULL)
 		pg_fatal("out of memory\n");
@@ -152,9 +163,9 @@ readOneRecord(const char *datadir, XLogRecPtr ptr, int tliIndex)
  * Find the previous checkpoint preceding given WAL position.
  */
 void
-findLastCheckpoint(const char *datadir, XLogRecPtr forkptr, int tliIndex,
+findLastCheckpoint(const char *datadir, ControlFileData *targetCF, XLogRecPtr forkptr, int tliIndex,
 				   XLogRecPtr *lastchkptrec, TimeLineID *lastchkpttli,
-				   XLogRecPtr *lastchkptredo)
+				   XLogRecPtr *lastchkptredo, const char *restoreCommand)
 {
 	/* Walk backwards, starting from the given record */
 	XLogRecord *record;
@@ -174,6 +185,9 @@ findLastCheckpoint(const char *datadir, XLogRecPtr forkptr, int tliIndex,
 
 	private.datadir = datadir;
 	private.tliIndex = tliIndex;
+	private.restoreCommand = restoreCommand;
+	private.oldrecptr = targetCF->checkPointCopy.redo;
+	private.oldtli = targetCF->checkPointCopy.ThisTimeLineID;
 	xlogreader = XLogReaderAllocate(&SimpleXLogPageRead, &private);
 	if (xlogreader == NULL)
 		pg_fatal("out of memory\n");
@@ -280,9 +294,51 @@ SimpleXLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
 
 		if (xlogreadfd < 0)
 		{
-			printf(_("could not open file \"%s\": %s\n"), xlogfpath,
+			bool  restore_ok;
+			char  lastRestartPointFname[MAXFNAMELEN];
+			XLogSegNo restartSegNo;
+
+			/*
+			 * If we have no restore_command to execute, then exit.
+			 */
+			if (private->restoreCommand == NULL)
+			{
+				printf(_("could not open file \"%s\": %s\n"), xlogfpath,
 				   strerror(errno));
-			return -1;
+				return -1;
+			}
+			
+			XLByteToSeg(private->oldrecptr, restartSegNo);
+			XLogFileName(lastRestartPointFname, private->oldtli, restartSegNo);
+
+			/*
+			 * Since we have restore_command to execute, then try to retreive
+			 * missing WAL file from the archive.
+			 */
+			restore_ok = RestoreArchivedWAL(private->datadir,
+											xlogfname,
+											private->restoreCommand,
+											lastRestartPointFname);
+
+			if (restore_ok)
+			{
+				xlogreadfd = open(xlogfpath, O_RDONLY | PG_BINARY, 0);
+
+				if (xlogreadfd < 0)
+				{
+					printf(_("could not open restored from archive file \"%s\": %s\n"), xlogfpath,
+				    	   strerror(errno));
+				    return -1;
+				}
+				else
+					pg_log(PG_DEBUG, "using restored from archive version of file \"%s\"\n", xlogfpath);
+			}
+			else
+			{
+				printf(_("could not restore file \"%s\" from archive: %s\n"), xlogfname,
+					   strerror(errno));
+				return -1;
+			}
 		}
 	}
 
@@ -390,4 +446,92 @@ extractPageInfo(XLogReaderState *record)
 
 		process_block_change(forknum, rnode, blkno);
 	}
+}
+
+/*
+ * Attempt to retrieve the specified file from off-line archival storage.
+ * If successful return true.
+ *
+ * For fixed-size files, the caller may pass the expected size as an
+ * additional crosscheck on successful recovery. If the file size is not
+ * known, set expectedSize = 0.
+ * 
+ * This is a copy-pasted and adapted to frontend version of
+ * RestoreArchivedFile function from transam/xlogarchive.c
+ */
+bool
+RestoreArchivedWAL(const char *path, const char *xlogfname,
+				   const char *restoreCommand, const char *lastRestartPointFname)
+{
+	char		xlogpath[MAXPGPATH];
+	char		xlogRestoreCmd[MAXPGPATH];
+	char	   *dp;
+	char	   *endp;
+	const char *sp;
+	int			rc;
+
+	snprintf(xlogpath, MAXPGPATH, "%s/" XLOGDIR "/%s", path, xlogfname);
+
+	/*
+	 * Construct the command to be executed
+	 */
+	dp = xlogRestoreCmd;
+	endp = xlogRestoreCmd + MAXPGPATH - 1;
+	*endp = '\0';
+
+	for (sp = restoreCommand; *sp; sp++)
+	{
+		if (*sp == '%')
+		{
+			switch (sp[1])
+			{
+				case 'p':
+					/* %p: relative path of target file */
+					sp++;
+					StrNCpy(dp, xlogpath, endp - dp);
+					make_native_path(dp);
+					dp += strlen(dp);
+					break;
+				case 'f':
+					/* %f: filename of desired file */
+					sp++;
+					StrNCpy(dp, xlogfname, endp - dp);
+					dp += strlen(dp);
+					break;
+				case 'r':
+					/* %r: filename of last restartpoint */
+					sp++;
+					StrNCpy(dp, lastRestartPointFname, endp - dp);
+					dp += strlen(dp);
+					break;
+				case '%':
+					/* convert %% to a single % */
+					sp++;
+					if (dp < endp)
+						*dp++ = *sp;
+					break;
+				default:
+					/* otherwise treat the % as not special */
+					if (dp < endp)
+						*dp++ = *sp;
+					break;
+			}
+		}
+		else
+		{
+			if (dp < endp)
+				*dp++ = *sp;
+		}
+	}
+	*dp = '\0';
+
+	/*
+	 * Copy xlog from archival storage to XLOGDIR
+	 */
+	rc = system(xlogRestoreCmd);
+
+	if (rc == 0)
+		return true;
+
+	return false;
 }
