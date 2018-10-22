@@ -39,6 +39,7 @@ use Config;
 use Exporter 'import';
 use File::Copy;
 use File::Path qw(rmtree);
+use File::Glob;
 use IPC::Run qw(run);
 use PostgresNode;
 use TestLib;
@@ -218,6 +219,40 @@ sub run_pg_rewind
 				"--source-server", $standby_connstr,
 				"--target-pgdata=$master_pgdata" ],
 			'pg_rewind remote');
+	}
+	elsif ($test_mode eq "archive")
+	{
+
+		# Do rewind using a local pgdata as source and 
+		# specified directory with target WALs archive.
+		my $wals_archive_dir = "${TestLib::tmp_check}/master_wals_archive";
+		my $test_master_datadir = $node_master->data_dir;
+		my @wal_files = glob "$test_master_datadir/pg_wal/0000000*";
+		my $restore_command;
+
+		rmtree($wals_archive_dir);
+		mkdir($wals_archive_dir) or die;
+
+		# Move all old master WAL files to the archive/
+		foreach my $wal_file (@wal_files)
+		{
+			move($wal_file, "$wals_archive_dir/") or die;
+		}
+
+		$restore_command = "cp $wals_archive_dir/\%f \%p";
+		# $restore_command = "echo 0";
+
+		# Stop the master and be ready to perform the rewind
+		$node_standby->stop;
+		command_ok(
+			[
+				'pg_rewind',
+				"--debug",
+				"--source-pgdata=$standby_pgdata",
+				"--target-pgdata=$master_pgdata",
+				"-R", $restore_command
+			],
+			'pg_rewind archive');
 	}
 	else
 	{
