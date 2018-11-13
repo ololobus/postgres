@@ -920,8 +920,14 @@ ReorderBufferAssignChild(ReorderBuffer *rb, TransactionId xid,
 	{
 		if (subtxn->is_known_as_subxact)
 		{
-			elog(ERROR, "existing subxact %u assigned to unknown toplevel xact %u",
-				subxid, xid);
+			if (new_top)
+				elog(ERROR, "existing subxact %u assigned to unknown toplevel xact %u",
+					subxid, xid);
+			else
+			{
+				/* already associated, nothing to do */
+				return;
+			}
 		}
 		else
 		{
