@@ -10,9 +10,7 @@ that supports an extended subset of the SQL standard, including
 transactions, foreign keys, subqueries, triggers, user-defined types
 and functions.  This distribution also contains C language bindings.
 
-PostgreSQL has many language interfaces, many of which are listed here:
-
-	https://www.postgresql.org/download
+PostgreSQL has many language interfaces, many of which are listed here: https://www.postgresql.org/download
 
 See the file INSTALL for instructions on how to build and install
 PostgreSQL.  That file also lists supported operating systems and
