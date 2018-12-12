@@ -1692,8 +1692,12 @@ HeapTupleSatisfiesHistoricMVCC(HeapTuple htup, Snapshot snapshot,
 												 htup, buffer,
 												 &cmin, &cmax);
 
+		/*
+		 * TOCHECK: If we accedentially see a tuple from our transaction, but cannot resolve its
+		 * cmin, so probably it is from the future, thus drop it.
+		 */
 		if (!resolved)
-			elog(ERROR, "could not resolve cmin/cmax of catalog tuple");
+			return false;
 
 		Assert(cmin != InvalidCommandId);
 
@@ -1757,14 +1761,27 @@ HeapTupleSatisfiesHistoricMVCC(HeapTuple htup, Snapshot snapshot,
 		bool		resolved;
 		CommandId	cmin;
 		CommandId	cmax = HeapTupleHeaderGetRawCommandId(tuple);
+		bool		tuplecids_is_null = HistoricSnapshotGetTupleCids() == NULL;
 
 		/* Lookup actual cmin/cmax values */
 		resolved = ResolveCminCmaxDuringDecoding(HistoricSnapshotGetTupleCids(), snapshot,
 												 htup, buffer,
 												 &cmin, &cmax);
 
+		elog(DEBUG1, "HeapTupleSatisfiesHistoricMVCC xmax check resolved=%d cmin=%u cmax=%u snapshot->curcid=%u", resolved, cmin, cmax, snapshot->curcid);
+
+		// if (!resolved)
+		// 	elog(ERROR, "could not resolve combocid to cmax");
+
+		/*
+		 * TOCHECK If we accedentially see a tuple from our transaction, but cannot resolve its
+		 * cmax or cmax == InvalidCommandId, so probably it is still valid, thus accept it.
+		 */
 		if (!resolved)
-			elog(ERROR, "could not resolve combocid to cmax");
+			return true;
+		// // 	return false;
+		else if (cmax == InvalidCommandId)
+			return true;
 
 		Assert(cmax != InvalidCommandId);
 

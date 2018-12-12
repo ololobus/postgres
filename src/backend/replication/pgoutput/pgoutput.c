@@ -425,10 +425,17 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	 * transactions won't see their effects until then) and in an order
 	 * that we don't know at this point.
 	 */
-	if (in_streaming)
-		schema_sent = get_schema_sent_in_streamed_txn(relentry, topxid);
-	else
-		schema_sent = relentry->schema_sent;
+	// if (in_streaming)
+		// schema_sent = get_schema_sent_in_streamed_txn(relentry, topxid);
+	// else
+	// schema_sent = relentry->schema_sent;
+
+	/*
+	 * TOCHECK: We have to send schema after each catalog cheange and it may 
+	 * occur when streaming started, so we have to track new catalog changes
+	 * somehow.
+	 */
+	schema_sent = false;
 
 	/*
 	 * Write the relation schema if the current schema haven't been sent yet.

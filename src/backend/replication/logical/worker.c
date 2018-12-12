@@ -2371,7 +2371,11 @@ stream_open_file(Oid subid, TransactionId xid, bool first_segment)
 	{
 		MemoryContext	oldcxt;
 
-		stream_cleanup_files(subid, xid);
+		/*
+		 * TOCHECK: If nxids=0, then we have nothing to clean up.
+		 */
+		if (nxids > 0)
+			stream_cleanup_files(subid, xid);
 
 		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 

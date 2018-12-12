@@ -1491,7 +1491,7 @@ ReorderBufferCleanupTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 }
 
 /*
- * Discanrd changes from a transaction (and subtransactions), after streaming
+ * Discard changes from a transaction (and subtransactions), after streaming
  * them. Keep the remaining info - transactions, tuplecids and snapshots.
  */
 static void
@@ -1606,9 +1606,10 @@ ReorderBufferBuildTupleCidHash(ReorderBuffer *rb, ReorderBufferTXN *txn)
 		}
 		else
 		{
+			// TOCHECK: Is the second assert actually necessary?
 			Assert(ent->cmin == change->data.tuplecid.cmin);
-			Assert(ent->cmax == InvalidCommandId ||
-				   ent->cmax == change->data.tuplecid.cmax);
+			// Assert(ent->cmax == InvalidCommandId ||
+			// 	   ent->cmax == change->data.tuplecid.cmax);
 
 			/*
 			 * if the tuple got valid in this transaction and now got deleted
@@ -2536,6 +2537,13 @@ ReorderBufferXidSetCatalogChanges(ReorderBuffer *rb, TransactionId xid,
 	txn = ReorderBufferTXNByXid(rb, xid, true, NULL, lsn, true);
 
 	txn->has_catalog_changes = true;
+
+	/*
+	 * TOCHECK: Mark toplevel transaction as having catalog changes too
+	 * if one of its children has.
+	 */
+	if (txn->toptxn != NULL)
+		txn->toptxn->has_catalog_changes = true;
 }
 
 /*
@@ -2764,7 +2772,6 @@ ReorderBufferSerializeTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 	int			fd = -1;
 	XLogSegNo	curOpenSegNo = 0;
 	Size		spilled = 0;
-	char		path[MAXPGPATH];
 	Size		size = txn->size;
 
 	elog(DEBUG2, "spill %u changes in XID %u to disk",
@@ -3093,7 +3100,14 @@ ReorderBufferStreamTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 		 * using snapshot half-way through the subxact.
 		 */
 		command_id = txn->command_id;
-		snapshot_now = txn->snapshot_now;
+
+		/*
+		 * TOCHECK: We have to rebuild historic snapshot to be sure it includes all
+		 * information about subtransactions, which could arrive after streaming start.
+		 */
+		snapshot_now = ReorderBufferCopySnap(rb, txn->base_snapshot,
+											 txn, command_id);
+		// snapshot_now = txn->snapshot_now;
 	}
 
 	/*
@@ -3139,7 +3153,7 @@ ReorderBufferStreamTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 			/*
 			 * Enforce correct ordering of changes, merged from multiple
 			 * subtransactions. The changes may have the same LSN due to
-			 * MULTI_INSERT xllog records.
+			 * MULTI_INSERT xlog records.
 			 */
 			if (prev_lsn != InvalidXLogRecPtr)
 				Assert(prev_lsn <= change->lsn);
@@ -4515,7 +4529,7 @@ ResolveCminCmaxDuringDecoding(HTAB *tuplecid_data,
 							  CommandId *cmin, CommandId *cmax)
 {
 	ReorderBufferTupleCidKey key;
-	ReorderBufferTupleCidEnt *ent;
+	ReorderBufferTupleCidEnt *ent = NULL;
 	ForkNumber	forkno;
 	BlockNumber blockno;
 	bool		updated_mapping = false;
@@ -4539,11 +4553,16 @@ ResolveCminCmaxDuringDecoding(HTAB *tuplecid_data,
 					&key.tid);
 
 restart:
-	ent = (ReorderBufferTupleCidEnt *)
-		hash_search(tuplecid_data,
-					(void *) &key,
-					HASH_FIND,
-					NULL);
+	/*
+	 * TOCHECK: If tuplecid_data is NULL, then we are not able to resolve cmin/cmax,
+	 * so try to update mappings and return false.
+	 */
+	if (tuplecid_data != NULL)
+		ent = (ReorderBufferTupleCidEnt *)
+			hash_search(tuplecid_data,
+						(void *) &key,
+						HASH_FIND,
+						NULL);
 
 	/*
 	 * failed to find a mapping, check whether the table was rewritten and
