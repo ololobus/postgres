@@ -78,7 +78,7 @@ ALTER TABLE test_tab ADD COLUMN d text;
 ROLLBACK TO SAVEPOINT s10;
 RELEASE SAVEPOINT s10;
 SAVEPOINT s10;
-INSERT INTO test_tab (a, b, c, d, e) SELECT i, md5(i::text), i, md5(i::text), i FROM generate_series(5001, 6000) s(i);
+INSERT INTO test_tab SELECT i, md5(i::text), i, md5(i::text), i FROM generate_series(5001, 6000) s(i);
 SAVEPOINT s6;
 ALTER TABLE test_tab DROP d;
 INSERT INTO test_tab SELECT i, md5(i::text), i, i FROM generate_series(6001, 7000) s(i);

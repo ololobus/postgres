@@ -1768,19 +1768,11 @@ HeapTupleSatisfiesHistoricMVCC(HeapTuple htup, Snapshot snapshot,
 												 htup, buffer,
 												 &cmin, &cmax);
 
-		elog(DEBUG1, "HeapTupleSatisfiesHistoricMVCC xmax check resolved=%d cmin=%u cmax=%u snapshot->curcid=%u", resolved, cmin, cmax, snapshot->curcid);
-
-		// if (!resolved)
-		// 	elog(ERROR, "could not resolve combocid to cmax");
-
 		/*
-		 * TOCHECK If we accedentially see a tuple from our transaction, but cannot resolve its
+		 * TOCHECK: If we accedentially see a tuple from our transaction, but cannot resolve its
 		 * cmax or cmax == InvalidCommandId, so probably it is still valid, thus accept it.
 		 */
-		if (!resolved)
-			return true;
-		// // 	return false;
-		else if (cmax == InvalidCommandId)
+		if (!resolved || cmax == InvalidCommandId)
 			return true;
 
 		Assert(cmax != InvalidCommandId);

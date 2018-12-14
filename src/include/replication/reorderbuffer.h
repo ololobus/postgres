@@ -167,6 +167,11 @@ typedef struct ReorderBufferTXN
 	bool		has_catalog_changes;
 
 	/*
+	 * Do we need to send schema for this transaction in output plugin?
+	 */
+	bool		is_schema_sent;
+
+	/*
 	 * Do we know this is a subxact?
 	 */
 	bool		is_known_as_subxact;

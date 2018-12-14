@@ -2523,6 +2523,9 @@ ReorderBufferExecuteInvalidations(ReorderBuffer *rb, ReorderBufferTXN *txn)
 
 	for (i = 0; i < txn->ninvalidations; i++)
 		LocalExecuteInvalidationMessage(&txn->invalidations[i]);
+
+	/* Invalidate current schema as well */
+	txn->is_schema_sent = false;
 }
 
 /*
@@ -2539,11 +2542,21 @@ ReorderBufferXidSetCatalogChanges(ReorderBuffer *rb, TransactionId xid,
 	txn->has_catalog_changes = true;
 
 	/*
+	 * We read catalog changes from WAL, which are not yet sent, so
+	 * invalidate current schema in order output plugin can resend
+	 * schema again.
+	 */
+	txn->is_schema_sent = false;
+
+	/*
 	 * TOCHECK: Mark toplevel transaction as having catalog changes too
 	 * if one of its children has.
 	 */
 	if (txn->toptxn != NULL)
+	{
 		txn->toptxn->has_catalog_changes = true;
+		txn->toptxn->is_schema_sent = false;
+	}
 }
 
 /*
@@ -3330,6 +3343,11 @@ ReorderBufferStreamTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 						snapshot_now = change->data.snapshot;
 					}
 
+					/* 
+					 * TOCHECK: Snapshot changed, then invalidate current schema to reflect
+					 * possible catalog changes.
+					 */
+					txn->is_schema_sent = false;
 
 					/* and continue with the new one */
 					SetupHistoricSnapshot(snapshot_now, txn->tuplecid_hash);
@@ -3465,7 +3483,7 @@ ReorderBufferStreamTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 	rb->streamTxns += (txn->streamed) ? 1 : 0;
 	rb->streamBytes += txn->size;
 
-	elog(WARNING, "updating stream stats %p %ld %ld %ld",
+	elog(INFO, "updating stream stats %p %ld %ld %ld",
 		 rb, rb->streamCount, rb->streamTxns, txn->size);
 
 	/*

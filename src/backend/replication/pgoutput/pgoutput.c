@@ -426,16 +426,19 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	 * that we don't know at this point.
 	 */
 	// if (in_streaming)
-		// schema_sent = get_schema_sent_in_streamed_txn(relentry, topxid);
+	// 	schema_sent = get_schema_sent_in_streamed_txn(relentry, topxid);
 	// else
-	// schema_sent = relentry->schema_sent;
+	// 	schema_sent = relentry->schema_sent;
 
 	/*
-	 * TOCHECK: We have to send schema after each catalog cheange and it may 
-	 * occur when streaming started, so we have to track new catalog changes
-	 * somehow.
+	 * TOCHECK: We have to send schema after each catalog change and it may 
+	 * occur when streaming already started, so we have to track new catalog 
+	 * changes somehow.
 	 */
-	schema_sent = false;
+	if (in_streaming)
+		schema_sent = txn->is_schema_sent;
+	else
+		schema_sent = relentry->schema_sent;
 
 	/*
 	 * Write the relation schema if the current schema haven't been sent yet.
@@ -472,7 +475,11 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		relentry->xid = change->txn->xid;
 
 		if (in_streaming)
-			set_schema_sent_in_streamed_txn(relentry, topxid);
+		{
+			// TOCHECK: Maybe change flag location?
+			// set_schema_sent_in_streamed_txn(relentry, topxid);
+			txn->is_schema_sent = true;
+		}
 		else
 			relentry->schema_sent = true;
 	}
