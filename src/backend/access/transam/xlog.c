@@ -1123,8 +1123,6 @@ XLogInsertRecord(XLogRecData *rdata,
 	 */
 	WALInsertLockRelease();
 
-	MarkCurrentTransactionIdLoggedIfAny();
-
 	END_CRIT_SECTION();
 
 	/*
