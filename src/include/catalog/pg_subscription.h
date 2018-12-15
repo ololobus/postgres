@@ -50,6 +50,8 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 
 	int32		subworkmem;		/* Memory to use to decode changes. */
 
+	bool		substream;		/* Stream in-progress transactions. */
+
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* Connection string to the publisher */
 	text		subconninfo BKI_FORCE_NOT_NULL;
@@ -76,6 +78,7 @@ typedef struct Subscription
 	Oid			owner;			/* Oid of the subscription owner */
 	bool		enabled;		/* Indicates if the subscription is enabled */
 	int			workmem;		/* Memory to decode changes. */
+	bool		stream;			/* Allow streaming in-progress transactions. */
 	char	   *conninfo;		/* Connection string to the publisher */
 	char	   *slotname;		/* Name of the replication slot */
 	char	   *synccommit;		/* Synchronous commit setting for worker */
