@@ -174,11 +174,12 @@ typedef struct ReorderBufferChange
 #define RBTXN_HAS_CATALOG_CHANGES 0x0001
 #define RBTXN_IS_SUBXACT          0x0002
 #define RBTXN_IS_SERIALIZED       0x0004
-#define RBTXN_PREPARE             0x0008
-#define RBTXN_COMMIT_PREPARED     0x0010
-#define RBTXN_ROLLBACK_PREPARED   0x0020
-#define RBTXN_COMMIT              0x0040
-#define RBTXN_ROLLBACK            0x0080
+#define RBTXN_IS_STREAMED         0x0008
+#define RBTXN_PREPARE             0x0010
+#define RBTXN_COMMIT_PREPARED     0x0020
+#define RBTXN_ROLLBACK_PREPARED   0x0040
+#define RBTXN_COMMIT              0x0080
+#define RBTXN_ROLLBACK            0x0100
 
 /* does the txn have catalog changes */
 #define rbtxn_has_catalog_changes(txn) (txn->txn_flags & RBTXN_HAS_CATALOG_CHANGES)
@@ -192,6 +193,19 @@ typedef struct ReorderBufferChange
  * nentries_mem == nentries.
  */
 #define rbtxn_is_serialized(txn)       (txn->txn_flags & RBTXN_IS_SERIALIZED)
+/*
+ * Has this transaction been streamed to downstream? Similarly to spilling
+ * to disk, it's not trivial to deduce this from nentries and nentries_mem,
+ * for various reasons. For example, all changes may be in subtransactions
+ * in which case we'd have nentries==0 for the toplevel one, and it'd say
+ * nothing about the streaming. So we maintain this flag, but only for the
+ * toplevel transaction.
+ *
+ * Note: We never stream and serialize a transaction at the same time (e
+ * only do spill to disk when streaming is not supported by the plugin),
+ * so only one of those two flags may be set at any given time.
+ */
+#define rbtxn_is_streamed(txn)         (txn->txn_flags & RBTXN_IS_STREAMED)
 /* is this txn prepared? */
 #define rbtxn_prepared(txn)            (txn->txn_flags & RBTXN_PREPARE)
 /* was this prepared txn committed in the meanwhile? */
@@ -216,6 +230,16 @@ typedef struct ReorderBufferTXN
 	TransactionId toplevel_xid;
 	/* In case of 2PC we need to pass GID to output plugin */
 	char		 *gid;
+
+	/*
+	 * Do we need to send schema for this transaction in output plugin?
+	 */
+	bool		is_schema_sent;
+
+	/*
+	 * Toplevel transaction for this subxact (NULL for top-level).
+	 */
+	struct ReorderBufferTXN *toptxn;
 
 	/*
 	 * LSN of the first data carrying, WAL record with knowledge about this
@@ -268,6 +292,13 @@ typedef struct ReorderBufferTXN
 	Snapshot	base_snapshot;
 	XLogRecPtr	base_snapshot_lsn;
 	dlist_node	base_snapshot_node; /* link in txns_by_base_snapshot_lsn */
+
+	/*
+	 * Snapshot/CID from the previous streaming run. Only valid for already
+	 * streamed transactions (NULL/InvalidCommandId otherwise).
+	 */
+	Snapshot	snapshot_now;
+	CommandId	command_id;
 
 	/*
 	 * How many ReorderBufferChange's do we have in this txn.
