@@ -81,6 +81,28 @@ static void pg_decode_commit_prepared_txn(LogicalDecodingContext *ctx,
 static void pg_decode_abort_prepared_txn(LogicalDecodingContext *ctx,
 							 ReorderBufferTXN *txn,
 							 XLogRecPtr abort_lsn);
+static void pg_decode_stream_message(LogicalDecodingContext *ctx,
+						 ReorderBufferTXN *txn, XLogRecPtr message_lsn,
+						 bool transactional, const char *prefix,
+						 Size sz, const char *message);
+static void pg_decode_stream_change(LogicalDecodingContext *ctx,
+						ReorderBufferTXN *txn,
+						Relation relation,
+						ReorderBufferChange *change);
+static void pg_decode_stream_truncate(LogicalDecodingContext *ctx,
+				   ReorderBufferTXN *txn,
+				   int nrelations, Relation relations[],
+				   ReorderBufferChange *change);
+static void pg_decode_stream_abort(LogicalDecodingContext *ctx,
+					   ReorderBufferTXN *txn,
+					   XLogRecPtr abort_lsn);
+static void pg_decode_stream_commit(LogicalDecodingContext *ctx,
+						ReorderBufferTXN *txn,
+						XLogRecPtr apply_lsn);
+static void pg_decode_stream_start(LogicalDecodingContext *ctx,
+					   ReorderBufferTXN *txn);
+static void pg_decode_stream_stop(LogicalDecodingContext *ctx,
+					  ReorderBufferTXN *txn);
 
 void
 _PG_init(void)
@@ -107,6 +129,13 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->prepare_cb = pg_decode_prepare_txn;
 	cb->commit_prepared_cb = pg_decode_commit_prepared_txn;
 	cb->abort_prepared_cb = pg_decode_abort_prepared_txn;
+	cb->stream_message_cb = pg_decode_stream_message;
+	cb->stream_change_cb = pg_decode_stream_change;
+	cb->stream_truncate_cb = pg_decode_stream_truncate;
+	cb->stream_abort_cb = pg_decode_stream_abort;
+	cb->stream_commit_cb = pg_decode_stream_commit;
+	cb->stream_start_cb = pg_decode_stream_start;
+	cb->stream_stop_cb = pg_decode_stream_stop;
 }
 
 
@@ -719,5 +748,76 @@ pg_decode_message(LogicalDecodingContext *ctx,
 	appendStringInfo(ctx->out, "message: transactional: %d prefix: %s, sz: %zu content:",
 					 transactional, prefix, sz);
 	appendBinaryStringInfo(ctx->out, message, sz);
+	OutputPluginWrite(ctx, true);
+}
+
+static void
+pg_decode_stream_message(LogicalDecodingContext *ctx,
+						 ReorderBufferTXN *txn, XLogRecPtr lsn, bool transactional,
+						 const char *prefix, Size sz, const char *message)
+{
+	OutputPluginPrepareWrite(ctx, true);
+	appendStringInfo(ctx->out, "streaming message: transactional: %d prefix: %s, sz: %zu content:",
+					 transactional, prefix, sz);
+	appendBinaryStringInfo(ctx->out, message, sz);
+	OutputPluginWrite(ctx, true);
+}
+
+static void
+pg_decode_stream_change(LogicalDecodingContext *ctx,
+						ReorderBufferTXN *txn,
+						Relation relation,
+						ReorderBufferChange *change)
+{
+	OutputPluginPrepareWrite(ctx, true);
+	appendStringInfo(ctx->out, "streaming change for TXN %u", txn->xid);
+	OutputPluginWrite(ctx, true);
+}
+
+static void
+pg_decode_stream_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
+						  int nrelations, Relation relations[],
+						  ReorderBufferChange *change)
+{
+	OutputPluginPrepareWrite(ctx, true);
+	appendStringInfo(ctx->out, "streaming truncate for TXN %u", txn->xid);
+	OutputPluginWrite(ctx, true);
+}
+
+static void
+pg_decode_stream_abort(LogicalDecodingContext *ctx,
+					   ReorderBufferTXN *txn,
+					   XLogRecPtr abort_lsn)
+{
+	OutputPluginPrepareWrite(ctx, true);
+	appendStringInfo(ctx->out, "aborting streamed (sub)transaction TXN %u", txn->xid);
+	OutputPluginWrite(ctx, true);
+}
+
+static void
+pg_decode_stream_commit(LogicalDecodingContext *ctx,
+						ReorderBufferTXN *txn,
+						XLogRecPtr apply_lsn)
+{
+	OutputPluginPrepareWrite(ctx, true);
+	appendStringInfo(ctx->out, "committing streamed transaction TXN %u", txn->xid);
+	OutputPluginWrite(ctx, true);
+}
+
+static void
+pg_decode_stream_start(LogicalDecodingContext *ctx,
+					   ReorderBufferTXN *txn)
+{
+	OutputPluginPrepareWrite(ctx, true);
+	appendStringInfo(ctx->out, "opening a streamed block for transaction TXN %u", txn->xid);
+	OutputPluginWrite(ctx, true);
+}
+
+static void
+pg_decode_stream_stop(LogicalDecodingContext *ctx,
+					  ReorderBufferTXN *txn)
+{
+	OutputPluginPrepareWrite(ctx, true);
+	appendStringInfo(ctx->out, "closing a streamed block for transaction TXN %u", txn->xid);
 	OutputPluginWrite(ctx, true);
 }
