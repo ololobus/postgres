@@ -174,11 +174,12 @@ typedef struct ReorderBufferChange
 #define RBTXN_HAS_CATALOG_CHANGES 0x0001
 #define RBTXN_IS_SUBXACT          0x0002
 #define RBTXN_IS_SERIALIZED       0x0004
-#define RBTXN_PREPARE             0x0008
-#define RBTXN_COMMIT_PREPARED     0x0010
-#define RBTXN_ROLLBACK_PREPARED   0x0020
-#define RBTXN_COMMIT              0x0040
-#define RBTXN_ROLLBACK            0x0080
+#define RBTXN_IS_STREAMED         0x0008
+#define RBTXN_PREPARE             0x0010
+#define RBTXN_COMMIT_PREPARED     0x0020
+#define RBTXN_ROLLBACK_PREPARED   0x0040
+#define RBTXN_COMMIT              0x0080
+#define RBTXN_ROLLBACK            0x0100
 
 /* does the txn have catalog changes */
 #define rbtxn_has_catalog_changes(txn) (txn->txn_flags & RBTXN_HAS_CATALOG_CHANGES)
@@ -192,6 +193,8 @@ typedef struct ReorderBufferChange
  * nentries_mem == nentries.
  */
 #define rbtxn_is_serialized(txn)       (txn->txn_flags & RBTXN_IS_SERIALIZED)
+/* was this transactions streamed (as in-progress) */
+#define rbtxn_is_streamed(txn)         (txn->txn_flags & RBTXN_IS_STREAMED)
 /* is this txn prepared? */
 #define rbtxn_prepared(txn)            (txn->txn_flags & RBTXN_PREPARE)
 /* was this prepared txn committed in the meanwhile? */
@@ -216,6 +219,11 @@ typedef struct ReorderBufferTXN
 	TransactionId toplevel_xid;
 	/* In case of 2PC we need to pass GID to output plugin */
 	char		 *gid;
+
+	/*
+	 * Toplevel transaction for this subxact (NULL for top-level).
+	 */
+	struct ReorderBufferTXN *toptxn;
 
 	/*
 	 * LSN of the first data carrying, WAL record with knowledge about this
@@ -268,6 +276,13 @@ typedef struct ReorderBufferTXN
 	Snapshot	base_snapshot;
 	XLogRecPtr	base_snapshot_lsn;
 	dlist_node	base_snapshot_node; /* link in txns_by_base_snapshot_lsn */
+
+	/*
+	 * Snapshot/CID from the previous streaming run. Only valid for already
+	 * streamed transactions (NULL/InvalidCommandId otherwise).
+	 */
+	Snapshot	snapshot_now;
+	CommandId	command_id;
 
 	/*
 	 * How many ReorderBufferChange's do we have in this txn.
