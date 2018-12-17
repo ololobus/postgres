@@ -1,4 +1,4 @@
-# Test behavior with streaming transaction exceeding logical_work_mem
+# Test streaming of large transaction containing multiple subtransactions and rollbacks
 use strict;
 use warnings;
 use PostgresNode;
@@ -40,7 +40,7 @@ $node_publisher->safe_psql('postgres', "CREATE PUBLICATION tap_pub FOR TABLE tes
 
 my $appname = 'tap_sub';
 $node_subscriber->safe_psql('postgres',
-"CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub"
+"CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub WITH (streaming=true)"
 );
 
 wait_for_caught_up($node_publisher, $appname);
@@ -59,18 +59,16 @@ is($result, qq(2|0), 'check initial data was copied to subscriber');
 $node_publisher->safe_psql('postgres', q{
 BEGIN;
 INSERT INTO test_tab SELECT i, md5(i::text) FROM generate_series(3,500) s(i);
-ALTER TABLE test_tab ADD COLUMN c INT;
 SAVEPOINT s1;
-INSERT INTO test_tab SELECT i, md5(i::text), -i FROM generate_series(501,1000) s(i);
-ALTER TABLE test_tab ADD COLUMN d INT;
+INSERT INTO test_tab SELECT i, md5(i::text) FROM generate_series(501,1000) s(i);
 SAVEPOINT s2;
-INSERT INTO test_tab SELECT i, md5(i::text), -i, 2*i FROM generate_series(1001,1500) s(i);
-ALTER TABLE test_tab ADD COLUMN e INT;
+INSERT INTO test_tab SELECT i, md5(i::text) FROM generate_series(1001,1500) s(i);
 SAVEPOINT s3;
-INSERT INTO test_tab SELECT i, md5(i::text), -i, 2*i, -3*i FROM generate_series(1501,2000) s(i);
-ALTER TABLE test_tab DROP COLUMN c;
+INSERT INTO test_tab SELECT i, md5(i::text) FROM generate_series(1501,2000) s(i);
+ROLLBACK TO s2;
+INSERT INTO test_tab SELECT i, md5(i::text) FROM generate_series(2001,2500) s(i);
 ROLLBACK TO s1;
-INSERT INTO test_tab SELECT i, md5(i::text), i FROM generate_series(501,1000) s(i);
+INSERT INTO test_tab SELECT i, md5(i::text) FROM generate_series(2501,3000) s(i);
 COMMIT;
 });
 
@@ -78,7 +76,7 @@ wait_for_caught_up($node_publisher, $appname);
 
 $result =
   $node_subscriber->safe_psql('postgres', "SELECT count(*), count(c) FROM test_tab");
-is($result, qq(1000|500), 'check extra columns contain local defaults');
+is($result, qq(1000|0), 'check extra columns contain local defaults');
 
 $node_subscriber->stop;
 $node_publisher->stop;

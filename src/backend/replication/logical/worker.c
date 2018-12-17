@@ -2444,9 +2444,20 @@ stream_open_file(Oid subid, TransactionId xid, bool first_segment)
 	{
 		MemoryContext	oldcxt;
 
-		stream_cleanup_files(subid, xid);
+		/*
+		 * TOCHECK: If nxids=0, then we have nothing to clean up.
+		 */
+		if (nxids > 0)
+			stream_cleanup_files(subid, xid);
 
 		oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+		/* TOCHECK: Initialize xids array if it is the first run. */
+		if (xids == NULL)
+		{
+			maxnxids = 64;
+			xids = palloc(maxnxids * sizeof(TransactionId));
+		}
 
 		/*
 		 * We need to remember the XIDs we spilled to files, so that we can
@@ -2462,16 +2473,8 @@ stream_open_file(Oid subid, TransactionId xid, bool first_segment)
 		 */
 		if (nxids == maxnxids)	/* array of XIDs is full */
 		{
-			if (!xids)
-			{
-				maxnxids = 64;
-				xids = palloc(maxnxids * sizeof(TransactionId));
-			}
-			else
-			{
-				maxnxids = 2 * maxnxids;
-				xids = repalloc(xids, maxnxids * sizeof(TransactionId));
-			}
+			maxnxids = 2 * maxnxids;
+			xids = repalloc(xids, maxnxids * sizeof(TransactionId));
 		}
 
 		xids[nxids++] = xid;

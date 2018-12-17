@@ -100,8 +100,8 @@ static void rel_sync_cache_relation_cb(Datum arg, Oid relid);
 static void rel_sync_cache_publication_cb(Datum arg, int cacheid,
 							  uint32 hashvalue);
 
-static void set_schema_sent_in_streamed_txn(RelationSyncEntry *entry, TransactionId xid);
-static bool get_schema_sent_in_streamed_txn(RelationSyncEntry *entry, TransactionId xid);
+// static void set_schema_sent_in_streamed_txn(RelationSyncEntry *entry, TransactionId xid);
+// static bool get_schema_sent_in_streamed_txn(RelationSyncEntry *entry, TransactionId xid);
 
 
 /*
@@ -370,7 +370,7 @@ pgoutput_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 static void
 maybe_send_schema(LogicalDecodingContext *ctx,
 				  TransactionId topxid, TransactionId xid,
-				  Relation relation, RelationSyncEntry *relentry)
+				  Relation relation, RelationSyncEntry *relentry, ReorderBufferTXN *txn)
 {
 	bool	schema_sent = relentry->schema_sent;
 
@@ -381,7 +381,16 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 	 * that we don't know at this point.
 	 */
 	if (in_streaming)
-		schema_sent = get_schema_sent_in_streamed_txn(relentry, topxid);
+	{
+		/*
+		 * TOCHECK: We have to send schema after each catalog change and it may 
+		 * occur when streaming already started, so we have to track new catalog 
+		 * changes somehow.
+		 */
+		schema_sent = txn->is_schema_sent;// && get_schema_sent_in_streamed_txn(relentry, topxid);
+		// schema_sent = false;
+		// schema_sent = get_schema_sent_in_streamed_txn(relentry, topxid);
+	}
 
 	if (!schema_sent)
 	{
@@ -415,7 +424,11 @@ maybe_send_schema(LogicalDecodingContext *ctx,
 		relentry->xid = xid;
 
 		if (in_streaming)
-			set_schema_sent_in_streamed_txn(relentry, topxid);
+		{
+			/* TOCHECK: Maybe change flag location? */
+			txn->is_schema_sent = true;
+			// set_schema_sent_in_streamed_txn(relentry, topxid);
+		}
 		else
 			relentry->schema_sent = true;
 	}
@@ -479,7 +492,7 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	/* Avoid leaking memory by using and resetting our own context */
 	old = MemoryContextSwitchTo(data->context);
 
-	maybe_send_schema(ctx, topxid, xid, relation, relentry);
+	maybe_send_schema(ctx, topxid, xid, relation, relentry, txn);
 
 	/* Send the data */
 	switch (change->action)
@@ -569,7 +582,7 @@ pgoutput_truncate(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 			continue;
 
 		relids[nrelids++] = relid;
-		maybe_send_schema(ctx, topxid, xid, relation, relentry);
+		maybe_send_schema(ctx, topxid, xid, relation, relentry, txn);
 	}
 
 	if (nrelids > 0)
@@ -769,33 +782,33 @@ init_rel_sync_cache(MemoryContext cachectx)
 								  (Datum) 0);
 }
 
-/*
- * We expect relatively small number of streamed transactions.
- */
-static bool
-get_schema_sent_in_streamed_txn(RelationSyncEntry *entry, TransactionId xid)
-{
-	ListCell *lc;
-	foreach (lc, entry->streamed_txns)
-	{
-		if (xid == lfirst_int(lc))
-			return true;
-	}
+// /*
+//  * We expect relatively small number of streamed transactions.
+//  */
+// static bool
+// get_schema_sent_in_streamed_txn(RelationSyncEntry *entry, TransactionId xid)
+// {
+// 	ListCell *lc;
+// 	foreach (lc, entry->streamed_txns)
+// 	{
+// 		if (xid == lfirst_int(lc))
+// 			return true;
+// 	}
 
-	return false;
-}
+// 	return false;
+// }
 
-static void
-set_schema_sent_in_streamed_txn(RelationSyncEntry *entry, TransactionId xid)
-{
-	MemoryContext	oldctx;
+// static void
+// set_schema_sent_in_streamed_txn(RelationSyncEntry *entry, TransactionId xid)
+// {
+// 	MemoryContext	oldctx;
 
-	oldctx = MemoryContextSwitchTo(CacheMemoryContext);
+// 	oldctx = MemoryContextSwitchTo(CacheMemoryContext);
 
-	entry->streamed_txns = lappend_int(entry->streamed_txns, xid);
+// 	entry->streamed_txns = lappend_int(entry->streamed_txns, xid);
 
-	MemoryContextSwitchTo(oldctx);
-}
+// 	MemoryContextSwitchTo(oldctx);
+// }
 
 /*
  * Find or create entry in the relation schema cache.

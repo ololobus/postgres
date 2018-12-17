@@ -1692,8 +1692,12 @@ HeapTupleSatisfiesHistoricMVCC(HeapTuple htup, Snapshot snapshot,
 												 htup, buffer,
 												 &cmin, &cmax);
 
+		/*
+		 * TOCHECK: If we accedentially see a tuple from our transaction, but cannot resolve its
+		 * cmin, so probably it is from the future, thus drop it.
+		 */
 		if (!resolved)
-			elog(ERROR, "could not resolve cmin/cmax of catalog tuple");
+			return false;
 
 		Assert(cmin != InvalidCommandId);
 
@@ -1763,10 +1767,12 @@ HeapTupleSatisfiesHistoricMVCC(HeapTuple htup, Snapshot snapshot,
 												 htup, buffer,
 												 &cmin, &cmax);
 
-		if (!resolved)
-			elog(ERROR, "could not resolve combocid to cmax");
-
-		Assert(cmax != InvalidCommandId);
+		/*
+		 * TOCHECK: If we accedentially see a tuple from our transaction, but cannot resolve its
+		 * cmax or cmax == InvalidCommandId, so probably it is still valid, thus accept it.
+		 */
+		if (!resolved || cmax == InvalidCommandId)
+			return true;
 
 		if (cmax >= snapshot->curcid)
 			return true;		/* deleted after scan started */

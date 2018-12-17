@@ -221,6 +221,11 @@ typedef struct ReorderBufferTXN
 	char		 *gid;
 
 	/*
+	 * Do we need to send schema for this transaction in output plugin?
+	 */
+	bool		is_schema_sent;
+
+	/*
 	 * Toplevel transaction for this subxact (NULL for top-level).
 	 */
 	struct ReorderBufferTXN *toptxn;

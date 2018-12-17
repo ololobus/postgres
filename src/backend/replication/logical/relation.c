@@ -167,6 +167,8 @@ logicalrep_relmap_update(LogicalRepRelation *remoterel)
 	entry = hash_search(LogicalRepRelMap, (void *) &remoterel->remoteid,
 						HASH_ENTER, &found);
 
+	// elog(LOG, "Updating relmap for relname=%s, remoteid=%u", remoterel->relname, remoterel->remoteid);
+
 	if (found)
 		logicalrep_relmap_free_entry(entry);
 

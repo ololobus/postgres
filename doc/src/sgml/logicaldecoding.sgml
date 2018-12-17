@@ -1057,7 +1057,7 @@ stream_commit_cb(...);  &lt;-- commit of the streamed transaction
    </para>
 
    <para>
-    Similarly to spill-to-disk behavior, sStreaming is triggered when the total
+    Similarly to spill-to-disk behavior, streaming is triggered when the total
     amount of changes decoded from the WAL (for all in-progress transactions)
     exceeds limit defined by <varname>logical_work_mem</varname> setting. At
     that point the largest toplevel transaction (measured by amount of memory
