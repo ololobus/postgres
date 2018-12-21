@@ -34,9 +34,9 @@ extern ObjectAddress DefineIndex(Oid relationId,
 			bool check_not_in_use,
 			bool skip_build,
 			bool quiet);
-extern void ReindexIndex(RangeVar *indexRelation, int options);
-extern Oid	ReindexTable(RangeVar *relation, int options);
-extern void ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
+extern void ReindexIndex(RangeVar *indexRelation, char *tableSpaceName, int options);
+extern Oid	ReindexTable(RangeVar *relation, char *tableSpaceName, int options);
+extern void ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind, char *tableSpaceName,
 					  int options);
 extern char *makeObjectName(const char *name1, const char *name2,
 			   const char *label);

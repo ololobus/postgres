@@ -30,12 +30,14 @@
 #include "access/multixact.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "commands/cluster.h"
 #include "commands/vacuum.h"
+#include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "pgstat.h"
@@ -87,6 +89,8 @@ void
 ExecVacuum(VacuumStmt *vacstmt, bool isTopLevel)
 {
 	VacuumParams params;
+	Oid tableSpaceOid = InvalidOid; /* Oid of tablespace to use for relations
+									 * store after VACUUM FULL. */
 
 	/* sanity checks on options */
 	Assert(vacstmt->options & (VACOPT_VACUUM | VACOPT_ANALYZE));
@@ -130,6 +134,18 @@ ExecVacuum(VacuumStmt *vacstmt, bool isTopLevel)
 		params.multixact_freeze_min_age = -1;
 		params.multixact_freeze_table_age = -1;
 	}
+
+	/* Get tablespace Oid to use. */
+	if (vacstmt->tablespacename)
+	{
+		if (vacstmt->options & VACOPT_FULL)
+			tableSpaceOid = get_tablespace_oid(vacstmt->tablespacename, false);
+		else
+			ereport(ERROR,
+				(errmsg("incompatible SET TABLESPACE option"),
+				errdetail("You can only use SET TABLESPACE with VACUUM FULL.")));
+	}
+	params.tablespace_oid = tableSpaceOid;
 
 	/* user-invoked vacuum is never "for wraparound" */
 	params.is_wraparound = false;
@@ -1526,8 +1542,9 @@ vacuum_rel(Oid relid, RangeVar *relation, int options, VacuumParams *params)
 	LOCKMODE	lmode;
 	Relation	onerel;
 	LockRelId	onerelid;
-	Oid			toast_relid;
-	Oid			save_userid;
+	Oid			toast_relid,
+				save_userid,
+				new_tablespaceoid = InvalidOid;
 	int			save_sec_context;
 	int			save_nestlevel;
 
@@ -1660,6 +1677,22 @@ vacuum_rel(Oid relid, RangeVar *relation, int options, VacuumParams *params)
 	}
 
 	/*
+	 * We cannot support moving system relations into different tablespaces.
+	 */
+	if (options & VACOPT_FULL && OidIsValid(params->tablespace_oid) && IsSystemRelation(onerel))
+	{
+		ereport(WARNING,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			errmsg("skipping tablespace change of \"%s\"",
+					RelationGetRelationName(onerel)),
+			errdetail("Cannot move system relation, only VACUUM is performed.")));
+	}
+	else
+	{
+		new_tablespaceoid = params->tablespace_oid;
+	}
+
+	/*
 	 * Get a session-level lock too. This will protect our access to the
 	 * relation across multiple transactions, so that we can vacuum the
 	 * relation's TOAST table (if any) secure in the knowledge that no one is
@@ -1708,7 +1741,7 @@ vacuum_rel(Oid relid, RangeVar *relation, int options, VacuumParams *params)
 			cluster_options |= CLUOPT_VERBOSE;
 
 		/* VACUUM FULL is now a variant of CLUSTER; see cluster.c */
-		cluster_rel(relid, InvalidOid, cluster_options);
+		cluster_rel(relid, InvalidOid, new_tablespaceoid, cluster_options);
 	}
 	else
 		lazy_vacuum_rel(onerel, options, params, vac_strategy);

@@ -3133,6 +3133,7 @@ typedef struct ClusterStmt
 	NodeTag		type;
 	RangeVar   *relation;		/* relation being indexed, or NULL if all */
 	char	   *indexname;		/* original index defined */
+	char	   *tablespacename; /* tablespace name to use for clustered relation. */
 	int			options;		/* OR of ClusterOption flags */
 } ClusterStmt;
 
@@ -3176,6 +3177,7 @@ typedef struct VacuumStmt
 	NodeTag		type;
 	int			options;		/* OR of VacuumOption flags */
 	List	   *rels;			/* list of VacuumRelation, or NIL for all */
+	char	   *tablespacename; /* tablespace name to use for vacuumed relation. */
 } VacuumStmt;
 
 /* ----------------------
@@ -3304,6 +3306,7 @@ typedef struct ReindexStmt
 	RangeVar   *relation;		/* Table or index to reindex */
 	const char *name;			/* name of database to reindex */
 	int			options;		/* Reindex options flags */
+	char	   *tablespacename;
 } ReindexStmt;
 
 /* ----------------------

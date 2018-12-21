@@ -35,6 +35,7 @@
 #include "catalog/toasting.h"
 #include "commands/cluster.h"
 #include "commands/tablecmds.h"
+#include "commands/tablespace.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "optimizer/planner.h"
@@ -67,7 +68,7 @@ typedef struct
 } RelToCluster;
 
 
-static void rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose);
+static void rebuild_relation(Relation OldHeap, Oid indexOid, Oid NewTableSpaceOid, bool verbose);
 static void copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
 			   bool verbose, bool *pSwapToastByContent,
 			   TransactionId *pFreezeXid, MultiXactId *pCutoffMulti);
@@ -105,6 +106,13 @@ static void reform_and_rewrite_tuple(HeapTuple tuple,
 void
 cluster(ClusterStmt *stmt, bool isTopLevel)
 {
+	/* Oid of tablespace to use for clustered relation. */
+	Oid tableSpaceOid = InvalidOid;
+
+	/* Select tablespace Oid to use. */
+	if (stmt->tablespacename)
+		tableSpaceOid = get_tablespace_oid(stmt->tablespacename, false);
+
 	if (stmt->relation != NULL)
 	{
 		/* This is the single-relation case. */
@@ -186,7 +194,7 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 		heap_close(rel, NoLock);
 
 		/* Do the job. */
-		cluster_rel(tableOid, indexOid, stmt->options);
+		cluster_rel(tableOid, indexOid, tableSpaceOid, stmt->options);
 	}
 	else
 	{
@@ -234,7 +242,7 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 			/* functions in indexes may want a snapshot set */
 			PushActiveSnapshot(GetTransactionSnapshot());
 			/* Do the job. */
-			cluster_rel(rvtc->tableOid, rvtc->indexOid,
+			cluster_rel(rvtc->tableOid, rvtc->indexOid, tableSpaceOid,
 						stmt->options | CLUOPT_RECHECK);
 			PopActiveSnapshot();
 			CommitTransactionCommand();
@@ -266,7 +274,7 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
  * and error messages should refer to the operation as VACUUM not CLUSTER.
  */
 void
-cluster_rel(Oid tableOid, Oid indexOid, int options)
+cluster_rel(Oid tableOid, Oid indexOid, Oid tableSpaceOid, int options)
 {
 	Relation	OldHeap;
 	bool		verbose = ((options & CLUOPT_VERBOSE) != 0);
@@ -412,7 +420,7 @@ cluster_rel(Oid tableOid, Oid indexOid, int options)
 	TransferPredicateLocksToHeapRelation(OldHeap);
 
 	/* rebuild_relation does all the dirty work */
-	rebuild_relation(OldHeap, indexOid, verbose);
+	rebuild_relation(OldHeap, indexOid, tableSpaceOid, verbose);
 
 	/* NB: rebuild_relation does heap_close() on OldHeap */
 }
@@ -569,7 +577,7 @@ mark_index_clustered(Relation rel, Oid indexOid, bool is_internal)
  * NB: this routine closes OldHeap at the right time; caller should not.
  */
 static void
-rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
+rebuild_relation(Relation OldHeap, Oid indexOid, Oid NewTableSpaceOid, bool verbose)
 {
 	Oid			tableOid = RelationGetRelid(OldHeap);
 	Oid			tableSpace = OldHeap->rd_rel->reltablespace;
@@ -579,6 +587,10 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
 	bool		swap_toast_by_content;
 	TransactionId frozenXid;
 	MultiXactId cutoffMulti;
+
+	/* Use new TeableSpace if passed. */
+	if (OidIsValid(NewTableSpaceOid))
+		tableSpace = NewTableSpaceOid;
 
 	/* Mark the correct index as clustered */
 	if (OidIsValid(indexOid))
@@ -1574,7 +1586,7 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	else if (newrelpersistence == RELPERSISTENCE_PERMANENT)
 		reindex_flags |= REINDEX_REL_FORCE_INDEXES_PERMANENT;
 
-	reindex_relation(OIDOldHeap, reindex_flags, 0);
+	reindex_relation(OIDOldHeap, InvalidOid, reindex_flags, 0);
 
 	/*
 	 * If the relation being rebuild is pg_class, swap_relation_files()

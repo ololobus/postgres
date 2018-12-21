@@ -22,6 +22,7 @@ PostgreSQL documentation
  <refsynopsisdiv>
 <synopsis>
 REINDEX [ ( VERBOSE ) ] { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } <replaceable class="parameter">name</replaceable>
+REINDEX [ ( VERBOSE ) ] { INDEX | TABLE } <replaceable class="parameter">name</replaceable> [ SET TABLESPACE <replaceable class="parameter">new_tablespace</replaceable> ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -147,6 +148,15 @@ REINDEX [ ( VERBOSE ) ] { INDEX | TABLE | SCHEMA | DATABASE | SYSTEM } <replacea
       Presently, <command>REINDEX DATABASE</command> and <command>REINDEX SYSTEM</command>
       can only reindex the current database, so their parameter must match
       the current database's name.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">new_tablespace</replaceable></term>
+    <listitem>
+     <para>
+      The name of the specific tablespace to store rebuilt indexes.
      </para>
     </listitem>
    </varlistentry>

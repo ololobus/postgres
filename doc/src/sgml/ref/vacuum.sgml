@@ -23,6 +23,8 @@ PostgreSQL documentation
 <synopsis>
 VACUUM [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <replaceable class="parameter">table_and_columns</replaceable> [, ...] ]
 VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] [ ANALYZE ] [ <replaceable class="parameter">table_and_columns</replaceable> [, ...] ]
+VACUUM ( FULL [, ...] ) [ SET TABLESPACE <replaceable class="parameter">new_tablespace</replaceable> ] [ <replaceable class="parameter">table_and_columns</replaceable> [, ...] ]
+VACUUM FULL [ FREEZE ] [ VERBOSE ] [ ANALYZE ] [ SET TABLESPACE <replaceable class="parameter">new_tablespace</replaceable> ] [ <replaceable class="parameter">table_and_columns</replaceable> [, ...] ]
 
 <phrase>where <replaceable class="parameter">option</replaceable> can be one of:</phrase>
 
@@ -202,6 +204,16 @@ VACUUM [ FULL ] [ FREEZE ] [ VERBOSE ] [ ANALYZE ] [ <replaceable class="paramet
      </para>
     </listitem>
    </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">new_tablespace</replaceable></term>
+    <listitem>
+     <para>
+      The name of the specific tablespace to write new copy of the table.
+     </para>
+    </listitem>
+   </varlistentry>
+
   </variablelist>
  </refsect1>
 

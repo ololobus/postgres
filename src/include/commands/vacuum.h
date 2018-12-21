@@ -151,6 +151,8 @@ typedef struct VacuumParams
 	int			log_min_duration;	/* minimum execution threshold in ms at
 									 * which  verbose logs are activated, -1
 									 * to use default */
+	Oid			tablespace_oid; /* tablespace Oid to use for store relations
+								 * after VACUUM FULL */
 } VacuumParams;
 
 /* GUC parameters */

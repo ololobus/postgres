@@ -20,6 +20,61 @@ ERROR:  unrecognized parameter "some_nonexistent_parameter"
 ALTER TABLESPACE regress_tblspace RESET (random_page_cost = 2.0); -- fail
 ERROR:  RESET must not include values for parameters
 ALTER TABLESPACE regress_tblspace RESET (random_page_cost, effective_io_concurrency); -- ok
+-- create table to test REINDEX, CLUSTER and VACUUM FULL with TABLESPACE change
+CREATE TABLE regress_tblspace_test_tbl (num1 bigint, num2 double precision, num3 double precision);
+INSERT INTO regress_tblspace_test_tbl (num1, num2, num3)
+  SELECT round(random()*100), random(), random()*42
+  FROM generate_series(1, 20000) s(i);
+CREATE INDEX regress_tblspace_test_tbl_idx ON regress_tblspace_test_tbl (num1);
+CLUSTER regress_tblspace_test_tbl USING regress_tblspace_test_tbl_idx; -- ok
+-- check REINDEX with TABLESPACE change
+REINDEX INDEX regress_tblspace_test_tbl_idx SET TABLESPACE regress_tblspace; -- ok
+REINDEX TABLE regress_tblspace_test_tbl SET TABLESPACE regress_tblspace; -- ok
+REINDEX TABLE pg_authid SET TABLESPACE regress_tblspace; -- fail
+ERROR:  cannot move system relation "pg_authid_rolname_index"
+REINDEX SCHEMA pg_catalog SET TABLESPACE regress_tblspace; -- fail
+ERROR:  incompatible SET TABLESPACE option
+DETAIL:  You can only use SET TABLESPACE with REINDEX { INDEX | TABLE }.
+REINDEX DATABASE postgres SET TABLESPACE regress_tblspace; -- fail
+ERROR:  incompatible SET TABLESPACE option
+DETAIL:  You can only use SET TABLESPACE with REINDEX { INDEX | TABLE }.
+REINDEX SYSTEM postgres SET TABLESPACE regress_tblspace; -- fail
+ERROR:  incompatible SET TABLESPACE option
+DETAIL:  You can only use SET TABLESPACE with REINDEX { INDEX | TABLE }.
+-- check CLUSTER with TABLESPACE change
+CLUSTER regress_tblspace_test_tbl SET TABLESPACE regress_tblspace; -- ok
+CLUSTER pg_authid USING pg_authid_rolname_index SET TABLESPACE regress_tblspace; -- fail
+ERROR:  cannot cluster a shared catalog
+-- check VACUUM with TABLESPACE change
+VACUUM (FULL) SET TABLESPACE regress_tblspace pg_authid; -- skip with warning
+WARNING:  skipping tablespace change of "pg_authid"
+DETAIL:  Cannot move system relation, only VACUUM is performed.
+VACUUM (ANALYSE) SET TABLESPACE regress_tblspace; -- fail
+ERROR:  incompatible SET TABLESPACE option
+DETAIL:  You can only use SET TABLESPACE with VACUUM FULL.
+-- check that all relations moved to new tablespace
+SELECT relname FROM pg_class
+WHERE reltablespace=(SELECT oid FROM pg_tablespace WHERE spcname='regress_tblspace')
+AND relname IN ('regress_tblspace_test_tbl_idx', 'regress_tblspace_test_tbl');
+            relname            
+-------------------------------
+ regress_tblspace_test_tbl
+ regress_tblspace_test_tbl_idx
+(2 rows)
+
+-- move back to pg_default tablespace
+REINDEX TABLE regress_tblspace_test_tbl SET TABLESPACE pg_default; -- ok
+CLUSTER regress_tblspace_test_tbl SET TABLESPACE pg_default; -- ok
+CLUSTER regress_tblspace_test_tbl USING regress_tblspace_test_tbl_idx SET TABLESPACE regress_tblspace; -- ok
+VACUUM (FULL, ANALYSE, FREEZE) SET TABLESPACE pg_default regress_tblspace_test_tbl; -- ok
+-- check that all relations moved back to pg_default
+SELECT relname FROM pg_class
+WHERE reltablespace=(SELECT oid FROM pg_tablespace WHERE spcname='regress_tblspace')
+AND relname IN ('regress_tblspace_test_tbl_idx', 'regress_tblspace_test_tbl');
+ relname 
+---------
+(0 rows)
+
 -- create a schema we can use
 CREATE SCHEMA testschema;
 -- try a table
@@ -277,6 +332,8 @@ ALTER TABLE ALL IN TABLESPACE regress_tblspace_renamed SET TABLESPACE pg_default
 NOTICE:  no matching relations in tablespace "regress_tblspace_renamed" found
 -- Should succeed
 DROP TABLESPACE regress_tblspace_renamed;
+DROP INDEX regress_tblspace_test_tbl_idx;
+DROP TABLE regress_tblspace_test_tbl;
 DROP SCHEMA testschema CASCADE;
 NOTICE:  drop cascades to 6 other objects
 DETAIL:  drop cascades to table testschema.foo

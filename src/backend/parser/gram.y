@@ -543,7 +543,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <list>	constraints_set_list
 %type <boolean> constraints_set_mode
-%type <str>		OptTableSpace OptConsTableSpace
+%type <str>		OptTableSpace OptConsTableSpace opt_set_tablespace_name
 %type <rolespec> OptTableSpaceOwner
 %type <ival>	opt_check_option
 
@@ -3935,6 +3935,11 @@ OnCommitOption:  ON COMMIT DROP				{ $$ = ONCOMMIT_DROP; }
 		;
 
 OptTableSpace:   TABLESPACE name					{ $$ = $2; }
+			| /*EMPTY*/								{ $$ = NULL; }
+		;
+
+opt_set_tablespace_name:
+			SET TABLESPACE name						{ $$ = $3; }
 			| /*EMPTY*/								{ $$ = NULL; }
 		;
 
@@ -8314,44 +8319,48 @@ DropTransformStmt: DROP TRANSFORM opt_if_exists FOR Typename LANGUAGE name opt_d
  *
  *		QUERY:
  *
- *		REINDEX [ (options) ] type <name>
+ *		REINDEX [ (options) ] type <name> [ SET TABLESPACE <tablespace_name> ]
  *****************************************************************************/
 
 ReindexStmt:
-			REINDEX reindex_target_type qualified_name
+			REINDEX reindex_target_type qualified_name opt_set_tablespace_name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
 					n->kind = $2;
 					n->relation = $3;
+					n->tablespacename = $4;
 					n->name = NULL;
 					n->options = 0;
 					$$ = (Node *)n;
 				}
-			| REINDEX reindex_target_multitable name
+			| REINDEX reindex_target_multitable name opt_set_tablespace_name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
 					n->kind = $2;
 					n->name = $3;
+					n->tablespacename = $4;
 					n->relation = NULL;
 					n->options = 0;
 					$$ = (Node *)n;
 				}
-			| REINDEX '(' reindex_option_list ')' reindex_target_type qualified_name
+			| REINDEX '(' reindex_option_list ')' reindex_target_type qualified_name opt_set_tablespace_name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
 					n->kind = $5;
 					n->relation = $6;
 					n->name = NULL;
 					n->options = $3;
+					n->tablespacename = $7;
 					$$ = (Node *)n;
 				}
-			| REINDEX '(' reindex_option_list ')' reindex_target_multitable name
+			| REINDEX '(' reindex_option_list ')' reindex_target_multitable name opt_set_tablespace_name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
 					n->kind = $5;
 					n->name = $6;
 					n->relation = NULL;
 					n->options = $3;
+					n->tablespacename = $7;
 					$$ = (Node *)n;
 				}
 		;
@@ -10421,14 +10430,14 @@ CreateConversionStmt:
 /*****************************************************************************
  *
  *		QUERY:
- *				CLUSTER [VERBOSE] <qualified_name> [ USING <index_name> ]
- *				CLUSTER [VERBOSE]
+ *				CLUSTER [VERBOSE] <qualified_name> [ USING <index_name> ] [ SET TABLESPACE <tablespace_name> ]
+ *				CLUSTER [VERBOSE] [ SET TABLESPACE <tablespace_name> ]
  *				CLUSTER [VERBOSE] <index_name> ON <qualified_name> (for pre-8.3)
  *
  *****************************************************************************/
 
 ClusterStmt:
-			CLUSTER opt_verbose qualified_name cluster_index_specification
+			CLUSTER opt_verbose qualified_name cluster_index_specification opt_set_tablespace_name
 				{
 					ClusterStmt *n = makeNode(ClusterStmt);
 					n->relation = $3;
@@ -10436,9 +10445,10 @@ ClusterStmt:
 					n->options = 0;
 					if ($2)
 						n->options |= CLUOPT_VERBOSE;
+					n->tablespacename = $5;
 					$$ = (Node*)n;
 				}
-			| CLUSTER opt_verbose
+			| CLUSTER opt_verbose opt_set_tablespace_name
 				{
 					ClusterStmt *n = makeNode(ClusterStmt);
 					n->relation = NULL;
@@ -10446,6 +10456,7 @@ ClusterStmt:
 					n->options = 0;
 					if ($2)
 						n->options |= CLUOPT_VERBOSE;
+					n->tablespacename = $3;
 					$$ = (Node*)n;
 				}
 			/* kept for pre-8.3 compatibility */
@@ -10457,6 +10468,7 @@ ClusterStmt:
 					n->options = 0;
 					if ($2)
 						n->options |= CLUOPT_VERBOSE;
+					n->tablespacename = NULL;
 					$$ = (Node*)n;
 				}
 		;
@@ -10471,6 +10483,8 @@ cluster_index_specification:
  *
  *		QUERY:
  *				VACUUM
+ *				VACUUM FULL [ SET TABLESPACE <tablespace_name> ] [ <table_and_columns> [, ...] ]
+ *				VACUUM (FULL) [ SET TABLESPACE <tablespace_name> ] [ <table_and_columns> [, ...] ]
  *				ANALYZE
  *
  *****************************************************************************/
@@ -10488,6 +10502,23 @@ VacuumStmt: VACUUM opt_full opt_freeze opt_verbose opt_analyze opt_vacuum_relati
 					if ($5)
 						n->options |= VACOPT_ANALYZE;
 					n->rels = $6;
+					n->tablespacename = NULL;
+					$$ = (Node *)n;
+				}
+			| VACUUM opt_full opt_freeze opt_verbose opt_analyze SET TABLESPACE name opt_vacuum_relation_list
+				{
+					VacuumStmt *n = makeNode(VacuumStmt);
+					n->options = VACOPT_VACUUM;
+					if ($2)
+						n->options |= VACOPT_FULL;
+					if ($3)
+						n->options |= VACOPT_FREEZE;
+					if ($4)
+						n->options |= VACOPT_VERBOSE;
+					if ($5)
+						n->options |= VACOPT_ANALYZE;
+					n->tablespacename = $8;
+					n->rels = $9;
 					$$ = (Node *)n;
 				}
 			| VACUUM '(' vacuum_option_list ')' opt_vacuum_relation_list
@@ -10495,6 +10526,15 @@ VacuumStmt: VACUUM opt_full opt_freeze opt_verbose opt_analyze opt_vacuum_relati
 					VacuumStmt *n = makeNode(VacuumStmt);
 					n->options = VACOPT_VACUUM | $3;
 					n->rels = $5;
+					n->tablespacename = NULL;
+					$$ = (Node *) n;
+				}
+			| VACUUM '(' vacuum_option_list ')' SET TABLESPACE name opt_vacuum_relation_list
+				{
+					VacuumStmt *n = makeNode(VacuumStmt);
+					n->options = VACOPT_VACUUM | $3;
+					n->tablespacename = $7;
+					n->rels = $8;
 					$$ = (Node *) n;
 				}
 		;
@@ -10603,7 +10643,7 @@ vacuum_relation_list:
 		;
 
 opt_vacuum_relation_list:
-			vacuum_relation_list					{ $$ = $1; }
+			vacuum_relation_list 					{ $$ = $1; }
 			| /*EMPTY*/								{ $$ = NIL; }
 		;
 

@@ -2205,10 +2205,11 @@ ChooseIndexColumnNames(List *indexElems)
  *		Recreate a specific index.
  */
 void
-ReindexIndex(RangeVar *indexRelation, int options)
+ReindexIndex(RangeVar *indexRelation, char *tableSpaceName, int options)
 {
 	Oid			indOid;
 	Oid			heapOid = InvalidOid;
+	Oid			tableSpaceOid = InvalidOid;
 	Relation	irel;
 	char		persistence;
 
@@ -2235,9 +2236,13 @@ ReindexIndex(RangeVar *indexRelation, int options)
 	}
 
 	persistence = irel->rd_rel->relpersistence;
+
+	if (tableSpaceName)
+		tableSpaceOid = get_tablespace_oid(tableSpaceName, false);
+
 	index_close(irel, NoLock);
 
-	reindex_index(indOid, false, persistence, options);
+	reindex_index(indOid, tableSpaceOid, false, persistence, options);
 }
 
 /*
@@ -2305,15 +2310,20 @@ RangeVarCallbackForReindexIndex(const RangeVar *relation,
  *		Recreate all indexes of a table (and of its toast table, if any)
  */
 Oid
-ReindexTable(RangeVar *relation, int options)
+ReindexTable(RangeVar *relation, char *tableSpaceName, int options)
 {
 	Oid			heapOid;
+	Oid 		tableSpaceOid = InvalidOid;
 
 	/* The lock level used here should match reindex_relation(). */
 	heapOid = RangeVarGetRelidExtended(relation, ShareLock, 0,
 									   RangeVarCallbackOwnsTable, NULL);
 
+	if (tableSpaceName)
+		tableSpaceOid = get_tablespace_oid(tableSpaceName, false);
+
 	if (!reindex_relation(heapOid,
+						  tableSpaceOid,
 						  REINDEX_REL_PROCESS_TOAST |
 						  REINDEX_REL_CHECK_CONSTRAINTS,
 						  options))
@@ -2333,10 +2343,11 @@ ReindexTable(RangeVar *relation, int options)
  * That means this must not be called within a user transaction block!
  */
 void
-ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
+ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind, char *tableSpaceName,
 					  int options)
 {
 	Oid			objectOid;
+	Oid			tableSpaceOid = InvalidOid;
 	Relation	relationRelation;
 	HeapScanDesc scan;
 	ScanKeyData scan_keys[1];
@@ -2378,6 +2389,9 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 						   objectName);
 	}
+
+	if (tableSpaceName)
+		tableSpaceOid = get_tablespace_oid(tableSpaceName, false);
 
 	/*
 	 * Create a memory context that will survive forced transaction commits we
@@ -2485,6 +2499,7 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 		/* functions in indexes may want a snapshot set */
 		PushActiveSnapshot(GetTransactionSnapshot());
 		if (reindex_relation(relid,
+							 tableSpaceOid,
 							 REINDEX_REL_PROCESS_TOAST |
 							 REINDEX_REL_CHECK_CONSTRAINTS,
 							 options))
