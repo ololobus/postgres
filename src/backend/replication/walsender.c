@@ -255,7 +255,7 @@ static XLogRecPtr WalSndWaitForWal(XLogRecPtr loc);
 static void LagTrackerWrite(XLogRecPtr lsn, TimestampTz local_flush_time);
 static TimeOffset LagTrackerRead(int head, XLogRecPtr lsn, TimestampTz now);
 static bool TransactionIdInRecentPast(TransactionId xid, uint32 epoch);
-
+static void UpdateSpillStats(LogicalDecodingContext *ctx);
 static void XLogRead(char *buf, XLogRecPtr startptr, Size count);
 
 
@@ -1257,7 +1257,8 @@ WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 /*
  * LogicalDecodingContext 'update_progress' callback.
  *
- * Write the current position to the lag tracker (see XLogSendPhysical).
+ * Write the current position to the lag tracker (see XLogSendPhysical),
+ * and update the spill/stream statistics.
  */
 static void
 WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid)
@@ -1276,6 +1277,12 @@ WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId 
 
 	LagTrackerWrite(lsn, now);
 	sendTime = now;
+
+	/*
+	 * Update statistics about transactions that spilled to disk or
+	 * streamed to subscriber (before being committed).
+	 */
+	UpdateSpillStats(ctx);
 }
 
 /*
@@ -2309,6 +2316,12 @@ InitWalSenderSlot(void)
 			walsnd->state = WALSNDSTATE_STARTUP;
 			walsnd->latch = &MyProc->procLatch;
 			walsnd->replyTime = 0;
+			walsnd->spillTxns = 0;
+			walsnd->spillCount = 0;
+			walsnd->spillBytes = 0;
+			walsnd->streamTxns = 0;
+			walsnd->streamCount = 0;
+			walsnd->streamBytes = 0;
 			SpinLockRelease(&walsnd->mutex);
 			/* don't need the lock anymore */
 			MyWalSnd = (WalSnd *) walsnd;
@@ -3223,7 +3236,7 @@ offset_to_interval(TimeOffset offset)
 Datum
 pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 {
-#define PG_STAT_GET_WAL_SENDERS_COLS	12
+#define PG_STAT_GET_WAL_SENDERS_COLS	18
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	TupleDesc	tupdesc;
 	Tuplestorestate *tupstore;
@@ -3278,6 +3291,12 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 		int			pid;
 		WalSndState state;
 		TimestampTz replyTime;
+		int64		spillTxns;
+		int64		spillCount;
+		int64		spillBytes;
+		int64		streamTxns;
+		int64		streamCount;
+		int64		streamBytes;
 		Datum		values[PG_STAT_GET_WAL_SENDERS_COLS];
 		bool		nulls[PG_STAT_GET_WAL_SENDERS_COLS];
 
@@ -3298,6 +3317,12 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 		applyLag = walsnd->applyLag;
 		priority = walsnd->sync_standby_priority;
 		replyTime = walsnd->replyTime;
+		spillTxns = walsnd->spillTxns;
+		spillCount = walsnd->spillCount;
+		spillBytes = walsnd->spillBytes;
+		streamTxns = walsnd->streamTxns;
+		streamCount = walsnd->streamCount;
+		streamBytes = walsnd->streamBytes;
 		SpinLockRelease(&walsnd->mutex);
 
 		memset(nulls, 0, sizeof(nulls));
@@ -3379,6 +3404,16 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 				nulls[11] = true;
 			else
 				values[11] = TimestampTzGetDatum(replyTime);
+
+			/* spill to disk */
+			values[12] = Int64GetDatum(spillTxns);
+			values[13] = Int64GetDatum(spillCount);
+			values[14] = Int64GetDatum(spillBytes);
+
+			/* stream over-sized transactions */
+			values[15] = Int64GetDatum(streamTxns);
+			values[16] = Int64GetDatum(streamCount);
+			values[17] = Int64GetDatum(streamBytes);
 		}
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
@@ -3614,4 +3649,26 @@ LagTrackerRead(int head, XLogRecPtr lsn, TimestampTz now)
 	/* Return the elapsed time since local flush time in microseconds. */
 	Assert(time != 0);
 	return now - time;
+}
+
+static void
+UpdateSpillStats(LogicalDecodingContext *ctx)
+{
+	ReorderBuffer *rb = ctx->reorder;
+
+	SpinLockAcquire(&MyWalSnd->mutex);
+
+	MyWalSnd->spillTxns = rb->spillTxns;
+	MyWalSnd->spillCount = rb->spillCount;
+	MyWalSnd->spillBytes = rb->spillBytes;
+
+	MyWalSnd->streamTxns = rb->streamTxns;
+	MyWalSnd->streamCount = rb->streamCount;
+	MyWalSnd->streamBytes = rb->streamBytes;
+
+	elog(WARNING, "UpdateSpillStats: updating stats %p %ld %ld %ld %ld %ld %ld",
+		 rb, rb->spillTxns, rb->spillCount, rb->spillBytes,
+			 rb->streamTxns, rb->streamCount, rb->streamBytes);
+
+	SpinLockRelease(&MyWalSnd->mutex);
 }
