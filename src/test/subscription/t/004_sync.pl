@@ -34,7 +34,7 @@ $node_publisher->safe_psql('postgres',
 
 my $appname = 'tap_sub';
 $node_subscriber->safe_psql('postgres',
-	"CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub"
+	"CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub WITH (streaming = on)"
 );
 
 $node_publisher->wait_for_catchup($appname);
@@ -57,7 +57,7 @@ $node_publisher->safe_psql('postgres',
 
 # recreate the subscription, it will try to do initial copy
 $node_subscriber->safe_psql('postgres',
-	"CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub"
+	"CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub WITH (streaming = on)"
 );
 
 # but it will be stuck on data copy as it will fail on constraint
@@ -79,7 +79,7 @@ is($result, qq(20), 'initial data synced for second sub');
 
 # now check another subscription for the same node pair
 $node_subscriber->safe_psql('postgres',
-	"CREATE SUBSCRIPTION tap_sub2 CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub WITH (copy_data = false)"
+	"CREATE SUBSCRIPTION tap_sub2 CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub WITH (copy_data = false, streaming = on)"
 );
 
 # wait for it to start
@@ -101,7 +101,7 @@ $node_subscriber->safe_psql('postgres', "DELETE FROM tab_rep;");
 
 # recreate the subscription again
 $node_subscriber->safe_psql('postgres',
-	"CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub"
+	"CREATE SUBSCRIPTION tap_sub CONNECTION '$publisher_connstr application_name=$appname' PUBLICATION tap_pub WITH (streaming = on)"
 );
 
 # and wait for data sync to finish again
