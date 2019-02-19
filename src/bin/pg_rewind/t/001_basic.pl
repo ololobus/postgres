@@ -1,7 +1,7 @@
 use strict;
 use warnings;
 use TestLib;
-use Test::More tests => 15;
+use Test::More tests => 25;
 
 use FindBin;
 use lib $FindBin::RealBin;
@@ -171,5 +171,7 @@ in master, before promotion
 # Run the test in both modes
 run_test('local');
 run_test('remote');
+run_test('archive');
+run_test('archive_conf');
 
 exit(0);
