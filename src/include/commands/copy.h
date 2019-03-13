@@ -21,11 +21,13 @@
 
 /* CopyStateData is private in commands/copy.c */
 typedef struct CopyStateData *CopyState;
+typedef struct CopyFromStateData *CopyFromState;
 typedef int (*copy_data_source_cb) (void *outbuf, int minread, int maxread);
 
 extern void DoCopy(ParseState *state, const CopyStmt *stmt,
 	   int stmt_location, int stmt_len,
-	   uint64 *processed);
+	   uint64 *processed, const char *query_string,
+     bool is_top_level);
 
 extern void ProcessCopyOptions(ParseState *pstate, CopyState cstate, bool is_from, List *options);
 extern CopyState BeginCopyFrom(ParseState *pstate, Relation rel, const char *filename,
@@ -37,7 +39,9 @@ extern bool NextCopyFromRawFields(CopyState cstate,
 					  char ***fields, int *nfields);
 extern void CopyFromErrorCallback(void *arg);
 
+extern void CopyFromBgwMainLoop(Datum main_arg);
 extern uint64 CopyFrom(CopyState cstate);
+extern uint64 ParallelCopyFrom(CopyState cstate, const char *query_string);
 
 extern DestReceiver *CreateCopyDestReceiver(void);
 

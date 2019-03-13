@@ -559,7 +559,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 				DoCopy(pstate, (CopyStmt *) parsetree,
 					   pstmt->stmt_location, pstmt->stmt_len,
-					   &processed);
+					   &processed, queryString, isTopLevel);
 				if (completionTag)
 					snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
 							 "COPY " UINT64_FORMAT, processed);
