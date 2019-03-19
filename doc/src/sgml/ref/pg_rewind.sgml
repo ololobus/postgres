@@ -177,6 +177,22 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>-s</option></term>
+      <term><option>--no-ensure-shutdown</option></term>
+      <listitem>
+       <para>
+        By default, <application>pg_rewind</application> makes sure target is
+        cleanly shutdown before doing recovery by launching a single mode
+        postgres instance if needed to ensure the target has completed crash
+        recovery and pg_control is in clean shutdown state. Clean shutdown
+        state is a prerequisite of <application>pg_rewind</application>.
+        With this option, <application>pg_rewind</application> skips this and
+        then users need to do this themselves.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>-n</option></term>
       <term><option>--dry-run</option></term>
       <listitem>
