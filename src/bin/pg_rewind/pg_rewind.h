@@ -16,8 +16,9 @@
 #include "access/timeline.h"
 #include "storage/block.h"
 #include "storage/relfilenode.h"
-
 #include "common/logging.h"
+
+#include "libpq-fe.h"
 
 /* Configuration options */
 extern char *datadir_target;
@@ -26,6 +27,7 @@ extern char *connstr_source;
 extern bool showprogress;
 extern bool dry_run;
 extern int	WalSegSz;
+extern PGconn *conn;
 
 /* Target history */
 extern TimeLineHistoryEntry *targetHistory;
