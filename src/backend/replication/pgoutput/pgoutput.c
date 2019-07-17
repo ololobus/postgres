@@ -20,6 +20,7 @@
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
+#include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
 
 #include "fmgr.h"
@@ -417,7 +418,7 @@ pgoutput_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 		/* prepare context per tuple */
 		ecxt = GetPerTupleExprContext(estate);
 		oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
-		ecxt->ecxt_scantuple = ExecInitExtraTupleSlot(estate, tupdesc);
+		ecxt->ecxt_scantuple = ExecInitExtraTupleSlot(estate, tupdesc, &TTSOpsVirtual);
 
 		ExecStoreHeapTuple(new_tuple ? new_tuple : old_tuple, ecxt->ecxt_scantuple, false);
 
