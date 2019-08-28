@@ -122,12 +122,10 @@ extern TransactionId logicalrep_read_stream_stop(StringInfo in);
 
 extern void logicalrep_write_stream_commit(StringInfo out, ReorderBufferTXN *txn,
 						XLogRecPtr commit_lsn);
-extern TransactionId logicalrep_read_stream_commit(StringInfo out,
+extern void logicalrep_read_stream_commit(StringInfo out,
 					   LogicalRepCommitData *commit_data);
 
 extern void logicalrep_write_stream_abort(StringInfo out,
 							  TransactionId xid, TransactionId subxid);
-extern void logicalrep_read_stream_abort(StringInfo in,
-							 TransactionId *xid, TransactionId *subxid);
 
 #endif							/* LOGICALREP_PROTO_H */

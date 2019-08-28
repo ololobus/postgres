@@ -789,13 +789,10 @@ logicalrep_write_stream_commit(StringInfo out, ReorderBufferTXN *txn,
 	pq_sendint64(out, txn->commit_time);
 }
 
-TransactionId
+void
 logicalrep_read_stream_commit(StringInfo in, LogicalRepCommitData *commit_data)
 {
-	TransactionId	xid;
 	uint8			flags;
-
-	xid = pq_getmsgint(in, 4);
 
 	/* read flags (unused for now) */
 	flags = pq_getmsgbyte(in);
@@ -807,8 +804,6 @@ logicalrep_read_stream_commit(StringInfo in, LogicalRepCommitData *commit_data)
 	commit_data->commit_lsn = pq_getmsgint64(in);
 	commit_data->end_lsn = pq_getmsgint64(in);
 	commit_data->committime = pq_getmsgint64(in);
-
-	return xid;
 }
 
 void
@@ -822,14 +817,4 @@ logicalrep_write_stream_abort(StringInfo out, TransactionId xid,
 	/* transaction ID (we're starting to stream, so must be valid) */
 	pq_sendint32(out, xid);
 	pq_sendint32(out, subxid);
-}
-
-void
-logicalrep_read_stream_abort(StringInfo in, TransactionId *xid,
-							 TransactionId *subxid)
-{
-	Assert(xid && subxid);
-
-	*xid = pq_getmsgint(in, 4);
-	*subxid = pq_getmsgint(in, 4);
 }
