@@ -13,6 +13,7 @@
 #define LOGICALWORKER_H
 
 extern void ApplyWorkerMain(Datum main_arg);
+extern void LogicalApplyBgwMain(Datum main_arg);
 
 extern bool IsLogicalWorker(void);
 
