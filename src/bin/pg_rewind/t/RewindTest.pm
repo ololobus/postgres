@@ -266,9 +266,18 @@ sub run_pg_rewind
 			[
 				'pg_rewind',                      "--debug",
 				"--source-server",                $standby_connstr,
-				"--target-pgdata=$master_pgdata", "--no-sync"
+				"--target-pgdata=$master_pgdata", "-R", "--no-sync"
 			],
 			'pg_rewind remote');
+
+		# Check that standby.signal has been created.
+		ok(-e "$master_pgdata/standby.signal");
+
+		# Now, when pg_rewind apparently succeeded with minimal permissions,
+		# add REPLICATION privilege.  So we could test that new standby
+		# is able to connect to the new master with generated config.
+		$node_standby->psql(
+			'postgres', "ALTER ROLE rewind_user WITH REPLICATION;");
 	}
 	else
 	{
