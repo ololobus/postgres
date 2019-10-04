@@ -3,7 +3,7 @@
 use strict;
 use warnings;
 use TestLib;
-use Test::More tests => 5;
+use Test::More tests => 8;
 
 use File::Find;
 

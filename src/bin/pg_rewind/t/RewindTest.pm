@@ -227,8 +227,56 @@ sub run_pg_rewind
 	# Append the rewind-specific role to the connection string.
 	$standby_connstr = "$standby_connstr user=rewind_user";
 
-	# Stop the master and be ready to perform the rewind
+	# Stop the master cleanly to check dry-run mode.
 	$node_master->stop;
+
+	# First run pg_rewind in dry-run mode
+	if ($test_mode eq "local")
+	{
+
+		# Stop the new master and be ready to perform the rewind
+		# Do rewind in dry-run mode using a local pgdata as source
+		$node_standby->stop;
+		command_ok(
+			[
+				'pg_rewind',
+				"--debug", "--no-sync", "--dry-run",
+				"--source-pgdata=$standby_pgdata",
+				"--target-pgdata=$master_pgdata",
+				"--no-ensure-shutdown"
+			],
+			'pg_rewind local with --dry-run');
+	}
+	elsif ($test_mode eq "remote")
+	{
+
+		# Do rewind in dry-run mode using a remote connection as source
+		command_ok(
+			[
+				'pg_rewind',
+				"--debug", "--no-sync", "--dry-run",
+				"--source-server", $standby_connstr,
+				"--target-pgdata=$master_pgdata",
+				"--write-recovery-conf", "--progress"
+			],
+			'pg_rewind remote with --dry-run');
+
+		# Check that standby.signal hasn't been created.
+		ok(! -e "$master_pgdata/standby.signal",
+			'standby.signal is absent');
+	}
+	else
+	{
+
+		# Cannot come here normally
+		croak("Incorrect test mode specified");
+	}
+
+	# Start and stop the master and be ready to perform the rewind.
+	# The cluster needs recovery to finish once, and pg_rewind makes
+	# sure that it happens automatically.
+	$node_master->start;
+	$node_master->stop('immediate');
 
 	# At this point, the rewind processing is ready to run.
 	# We now have a very simple scenario with a few diverged WAL record.
@@ -246,8 +294,6 @@ sub run_pg_rewind
 	{
 
 		# Do rewind using a local pgdata as source
-		# Stop the master and be ready to perform the rewind
-		$node_standby->stop;
 		command_ok(
 			[
 				'pg_rewind',
@@ -261,30 +307,27 @@ sub run_pg_rewind
 	elsif ($test_mode eq "remote")
 	{
 
-		# Do rewind using a remote connection as source
+		# Do rewind using a remote connection as source, generating
+		# recovery configuration automatically.
 		command_ok(
 			[
 				'pg_rewind',                      "--debug",
 				"--source-server",                $standby_connstr,
-				"--target-pgdata=$master_pgdata", "-R",
-				"--no-sync"
+				"--target-pgdata=$master_pgdata", "--no-sync",
+				"--write-recovery-conf"
 			],
 			'pg_rewind remote');
 
-		# Check that standby.signal has been created.
-		ok(-e "$master_pgdata/standby.signal");
+		# Check that standby.signal is here as recovery configuration
+		# was requested.
+		ok( -e "$master_pgdata/standby.signal",
+			'standby.signal created after pg_rewind');
 
 		# Now, when pg_rewind apparently succeeded with minimal permissions,
 		# add REPLICATION privilege.  So we could test that new standby
 		# is able to connect to the new master with generated config.
 		$node_standby->safe_psql('postgres',
 			"ALTER ROLE rewind_user WITH REPLICATION;");
-	}
-	else
-	{
-
-		# Cannot come here normally
-		croak("Incorrect test mode specified");
 	}
 
 	# Now move back postgresql.conf with old settings

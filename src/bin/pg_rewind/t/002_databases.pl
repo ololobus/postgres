@@ -1,7 +1,7 @@
 use strict;
 use warnings;
 use TestLib;
-use Test::More tests => 7;
+use Test::More tests => 10;
 
 use FindBin;
 use lib $FindBin::RealBin;
