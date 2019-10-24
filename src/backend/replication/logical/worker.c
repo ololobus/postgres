@@ -41,6 +41,7 @@
 
 #include "postgres.h"
 
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -147,7 +148,8 @@ static XLogRecPtr remote_final_lsn = InvalidXLogRecPtr;
 bool		in_streamed_transaction = false;
 
 static TransactionId stream_xid = InvalidTransactionId;
-static int	stream_fd = -1;
+// static int	stream_fd = -1;
+static FILE *stream_fd = NULL;
 
 typedef struct SubXactInfo
 {
@@ -267,7 +269,8 @@ handle_streamed_transaction(const char action, StringInfo s)
 	if (!in_streamed_transaction)
 		return false;
 
-	Assert(stream_fd != -1);
+	// Assert(stream_fd != -1);
+	Assert(stream_fd != NULL);
 	Assert(TransactionIdIsValid(stream_xid));
 
 	/*
@@ -2058,6 +2061,7 @@ static void
 subxact_info_write(Oid subid, TransactionId xid)
 {
 	int			fd;
+	// FILE		fd;
 	char		path[MAXPGPATH];
 	uint32		checksum;
 	Size		len;
@@ -2067,6 +2071,7 @@ subxact_info_write(Oid subid, TransactionId xid)
 	subxact_filename(path, subid, xid);
 
 	fd = OpenTransientFile(path, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
+	// fd = AllocateFile(path, "wb")
 	if (fd < 0)
 	{
 		ereport(ERROR,
@@ -2087,6 +2092,7 @@ subxact_info_write(Oid subid, TransactionId xid)
 	pgstat_report_wait_start(WAIT_EVENT_LOGICAL_SUBXACT_WRITE);
 
 	if (write(fd, &checksum, sizeof(checksum)) != sizeof(checksum))
+	// if (fwrite(&checksum, sizeof(checksum), 1, fd) != sizeof(checksum))
 	{
 		int			save_errno = errno;
 
@@ -2100,6 +2106,7 @@ subxact_info_write(Oid subid, TransactionId xid)
 	}
 
 	if (write(fd, &nsubxacts, sizeof(nsubxacts)) != sizeof(nsubxacts))
+	// if (fwrite(&nsubxacts, sizeof(nsubxacts), 1, fd) != sizeof(nsubxacts))
 	{
 		int			save_errno = errno;
 
@@ -2113,6 +2120,7 @@ subxact_info_write(Oid subid, TransactionId xid)
 	}
 
 	if ((len > 0) && (write(fd, subxacts, len) != len))
+	// if ((len > 0) && (fwrite(subxacts, len, 1, fd) != len))
 	{
 		int			save_errno = errno;
 
@@ -2318,7 +2326,7 @@ subxact_info_add(TransactionId xid)
 	}
 
 	subxacts[nsubxacts].xid = xid;
-	subxacts[nsubxacts].offset = lseek(stream_fd, 0, SEEK_END);
+	subxacts[nsubxacts].offset = lseek(fileno(stream_fd), 0, SEEK_END);
 
 	nsubxacts++;
 }
@@ -2454,12 +2462,14 @@ static void
 stream_open_file(Oid subid, TransactionId xid, bool first_segment)
 {
 	char		path[MAXPGPATH];
-	int			flags;
+	char		flags[4];
+	// int			flags;
 
 	Assert(in_streamed_transaction);
 	Assert(OidIsValid(subid));
 	Assert(TransactionIdIsValid(xid));
-	Assert(stream_fd == -1);
+	// Assert(stream_fd == -1);
+	Assert(stream_fd == NULL);
 
 	/*
 	 * If this is the first segment for this transaction, try removing
@@ -2515,13 +2525,17 @@ stream_open_file(Oid subid, TransactionId xid, bool first_segment)
 	 * for writing, in append mode.
 	 */
 	if (first_segment)
-		flags = (O_WRONLY | O_CREAT | O_EXCL | PG_BINARY);
+		// flags = (O_WRONLY | O_CREAT | O_EXCL | PG_BINARY);
+		strcpy((char *) &flags, "wb");
 	else
-		flags = (O_WRONLY | O_APPEND | PG_BINARY);
+		// flags = (O_WRONLY | O_APPEND | PG_BINARY);
+		strcpy((char *) &flags, "ab");
 
-	stream_fd = OpenTransientFile(path, flags);
+	// stream_fd = OpenTransientFile(path, flags);
+	stream_fd = AllocateFile(path, flags);
 
-	if (stream_fd < 0)
+	// if (stream_fd < 0)
+	if (stream_fd == NULL)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m",
@@ -2540,12 +2554,15 @@ stream_close_file(void)
 {
 	Assert(in_streamed_transaction);
 	Assert(TransactionIdIsValid(stream_xid));
-	Assert(stream_fd != -1);
+	// Assert(stream_fd != -1);
+	Assert(stream_fd != NULL);
 
-	CloseTransientFile(stream_fd);
+	// CloseTransientFile(stream_fd);
+	FreeFile(stream_fd);
 
 	stream_xid = InvalidTransactionId;
-	stream_fd = -1;
+	// stream_fd = -1;
+	stream_fd = NULL;
 }
 
 /*
@@ -2567,7 +2584,7 @@ stream_write_change(char action, StringInfo s)
 
 	Assert(in_streamed_transaction);
 	Assert(TransactionIdIsValid(stream_xid));
-	Assert(stream_fd != -1);
+	// Assert(stream_fd != -1);
 
 	/* total on-disk size, including the action type character */
 	len = (s->len - s->cursor) + sizeof(char);
@@ -2575,13 +2592,15 @@ stream_write_change(char action, StringInfo s)
 	pgstat_report_wait_start(WAIT_EVENT_LOGICAL_CHANGES_WRITE);
 
 	/* first write the size */
-	if (write(stream_fd, &len, sizeof(len)) != sizeof(len))
+	// if (fwrite(stream_fd, &len, sizeof(len)) != sizeof(len))
+	if (fwrite(&len, sizeof(len), 1, stream_fd) != 1)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not serialize streamed change to file: %m")));
 
 	/* then the action */
-	if (write(stream_fd, &action, sizeof(action)) != sizeof(action))
+	// if (fwrite(stream_fd, &action, sizeof(action)) != sizeof(action))
+	if (fwrite(&action, sizeof(action), 1, stream_fd) != 1)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not serialize streamed change to file: %m")));
@@ -2589,7 +2608,8 @@ stream_write_change(char action, StringInfo s)
 	/* and finally the remaining part of the buffer (after the XID) */
 	len = (s->len - s->cursor);
 
-	if (write(stream_fd, &s->data[s->cursor], len) != len)
+	// if (fwrite(stream_fd, &s->data[s->cursor], len) != len)
+	if (fwrite(&s->data[s->cursor], len, 1, stream_fd) != 1)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not serialize streamed change to file: %m")));
