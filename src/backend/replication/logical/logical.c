@@ -1049,13 +1049,20 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 
 		SpinLockRelease(&MyReplicationSlot->mutex);
 
-		/* first write new xmin to disk, so we know what's up after a crash */
+		/*
+		 * First write new xmin and/or LSN to disk, so we know what's up
+		 * after a crash.
+		 */
 		if (updated_xmin || updated_restart)
 		{
 			ReplicationSlotMarkDirty();
 			ReplicationSlotSave();
 			elog(DEBUG1, "updated xmin: %u restart: %u", updated_xmin, updated_restart);
 		}
+
+		/* Compute global required LSN if restart_lsn was changed */
+		if (updated_restart)
+			ReplicationSlotsComputeRequiredLSN();
 
 		/*
 		 * Now the new xmin is safely on disk, we can let the global value
@@ -1070,7 +1077,6 @@ LogicalConfirmReceivedLocation(XLogRecPtr lsn)
 			SpinLockRelease(&MyReplicationSlot->mutex);
 
 			ReplicationSlotsComputeRequiredXmin(false);
-			ReplicationSlotsComputeRequiredLSN();
 		}
 	}
 	else

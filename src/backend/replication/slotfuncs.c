@@ -370,6 +370,19 @@ pg_physical_replication_slot_advance(XLogRecPtr moveto)
 		MyReplicationSlot->data.restart_lsn = moveto;
 		SpinLockRelease(&MyReplicationSlot->mutex);
 		retlsn = moveto;
+
+		/*
+		 * Dirty the slot as we updated data that is meant to be persistent
+		 * between restarts, flush it and re-compute global required LSN.
+		 *
+		 * If we change the order of operations and do not flush slot before
+		 * required LSN computing, then there will be a race.  Least recent WAL
+		 * segments may be already utilized, so if we crash and start again with
+		 * old restart_lsn there will be no WAL to proceed properly.
+		 */
+		ReplicationSlotMarkDirty();
+		ReplicationSlotSave();
+		ReplicationSlotsComputeRequiredLSN();
 	}
 
 	return retlsn;
@@ -463,6 +476,10 @@ pg_logical_replication_slot_advance(XLogRecPtr moveto)
 
 		if (ctx->reader->EndRecPtr != InvalidXLogRecPtr)
 		{
+			/*
+			 * It also takes care about computing and updating global
+			 * required xmin and LSN if needed.
+			 */
 			LogicalConfirmReceivedLocation(moveto);
 
 			/*
@@ -564,7 +581,10 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 						(uint32) (moveto >> 32), (uint32) moveto,
 						(uint32) (minlsn >> 32), (uint32) minlsn)));
 
-	/* Do the actual slot update, depending on the slot type */
+	/*
+	 * Do the actual slot update, depending on the slot type.  Slot will be
+	 * marked as dirty and flushed by pg_*_replication_slot_advance if needed.
+	 */
 	if (OidIsValid(MyReplicationSlot->data.database))
 		endlsn = pg_logical_replication_slot_advance(moveto);
 	else
@@ -572,15 +592,6 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 
 	values[0] = NameGetDatum(&MyReplicationSlot->data.name);
 	nulls[0] = false;
-
-	/* Update the on disk state when lsn was updated. */
-	if (XLogRecPtrIsInvalid(endlsn))
-	{
-		ReplicationSlotMarkDirty();
-		ReplicationSlotsComputeRequiredXmin(false);
-		ReplicationSlotsComputeRequiredLSN();
-		ReplicationSlotSave();
-	}
 
 	ReplicationSlotRelease();
 
