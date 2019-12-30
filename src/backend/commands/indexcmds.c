@@ -87,7 +87,7 @@ static char *ChooseIndexNameAddition(List *colnames);
 static List *ChooseIndexColumnNames(List *indexElems);
 static void RangeVarCallbackForReindexIndex(const RangeVar *relation,
 											Oid relId, Oid oldRelId, void *arg);
-static bool ReindexRelationConcurrently(Oid relationOid, int options);
+static bool ReindexRelationConcurrently(Oid relationOid, Oid tablespaceOid, int options);
 static void ReindexPartitionedIndex(Relation parentIdx);
 static void update_relispartition(Oid relationId, bool newval);
 
@@ -2331,10 +2331,11 @@ ChooseIndexColumnNames(List *indexElems)
  *		Recreate a specific index.
  */
 void
-ReindexIndex(RangeVar *indexRelation, int options, bool concurrent)
+ReindexIndex(RangeVar *indexRelation, char *newTableSpaceName, int options, bool concurrent)
 {
 	struct ReindexIndexCallbackState state;
 	Oid			indOid;
+	Oid			tablespaceOid = InvalidOid;
 	Relation	irel;
 	char		persistence;
 
@@ -2369,12 +2370,26 @@ ReindexIndex(RangeVar *indexRelation, int options, bool concurrent)
 	}
 
 	persistence = irel->rd_rel->relpersistence;
+
+	/* Define new tablespaceOid if it is wanted by caller */
+	if (newTableSpaceName)
+	{
+		tablespaceOid = get_tablespace_oid(newTableSpaceName, false);
+
+		/* Can't move a non-shared relation into pg_global */
+		if (tablespaceOid == GLOBALTABLESPACE_OID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot move non-shared relation to tablespace \"%s\"",
+							newTableSpaceName)));
+	}
+
 	index_close(irel, NoLock);
 
 	if (concurrent && persistence != RELPERSISTENCE_TEMP)
-		ReindexRelationConcurrently(indOid, options);
+		ReindexRelationConcurrently(indOid, tablespaceOid, options);
 	else
-		reindex_index(indOid, false, persistence,
+		reindex_index(indOid, tablespaceOid, false, persistence,
 					  options | REINDEXOPT_REPORT_PROGRESS);
 }
 
@@ -2453,10 +2468,11 @@ RangeVarCallbackForReindexIndex(const RangeVar *relation,
  *		Recreate all indexes of a table (and of its toast table, if any)
  */
 Oid
-ReindexTable(RangeVar *relation, int options, bool concurrent)
+ReindexTable(RangeVar *relation, char *newTableSpaceName, int options, bool concurrent)
 {
 	Oid			heapOid;
 	bool		result;
+	Oid 		tablespaceOid = InvalidOid;
 
 	/*
 	 * The lock level used here should match reindex_relation().
@@ -2471,9 +2487,22 @@ ReindexTable(RangeVar *relation, int options, bool concurrent)
 									   0,
 									   RangeVarCallbackOwnsTable, NULL);
 
+	/* Define new tablespaceOid if it is wanted by caller */
+	if (newTableSpaceName)
+	{
+		tablespaceOid = get_tablespace_oid(newTableSpaceName, false);
+
+		/* Can't move a non-shared relation into pg_global */
+		if (tablespaceOid == GLOBALTABLESPACE_OID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot move non-shared relation to tablespace \"%s\"",
+							newTableSpaceName)));
+	}
+
 	if (concurrent && get_rel_persistence(heapOid) != RELPERSISTENCE_TEMP)
 	{
-		result = ReindexRelationConcurrently(heapOid, options);
+		result = ReindexRelationConcurrently(heapOid, tablespaceOid, options);
 
 		if (!result)
 			ereport(NOTICE,
@@ -2483,6 +2512,7 @@ ReindexTable(RangeVar *relation, int options, bool concurrent)
 	else
 	{
 		result = reindex_relation(heapOid,
+								  tablespaceOid,
 								  REINDEX_REL_PROCESS_TOAST |
 								  REINDEX_REL_CHECK_CONSTRAINTS,
 								  options | REINDEXOPT_REPORT_PROGRESS);
@@ -2504,10 +2534,11 @@ ReindexTable(RangeVar *relation, int options, bool concurrent)
  * That means this must not be called within a user transaction block!
  */
 void
-ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
+ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind, char *newTableSpaceName,
 					  int options, bool concurrent)
 {
 	Oid			objectOid;
+	Oid			tablespaceOid = InvalidOid;
 	Relation	relationRelation;
 	TableScanDesc scan;
 	ScanKeyData scan_keys[1];
@@ -2518,6 +2549,7 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 	ListCell   *l;
 	int			num_keys;
 	bool		concurrent_warning = false;
+	bool		mapped_warning = false;
 
 	AssertArg(objectName);
 	Assert(objectKind == REINDEX_OBJECT_SCHEMA ||
@@ -2554,6 +2586,19 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 		if (!pg_database_ownercheck(objectOid, GetUserId()))
 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_DATABASE,
 						   objectName);
+	}
+
+	/* Define new tablespaceOid if it is wanted by caller */
+	if (newTableSpaceName)
+	{
+		tablespaceOid = get_tablespace_oid(newTableSpaceName, false);
+
+		/* Can't move a non-shared relation into pg_global */
+		if (tablespaceOid == GLOBALTABLESPACE_OID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot move non-shared relation to tablespace \"%s\"",
+							newTableSpaceName)));
 	}
 
 	/*
@@ -2646,6 +2691,22 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 			continue;
 		}
 
+		/*
+		 * Skip all mapped relations if TABLESPACE is specified.
+		 * relfilenode == 0 checks after that, similarly to
+		 * RelationIsMapped().
+		 */
+		if (OidIsValid(tablespaceOid) &&
+			!OidIsValid(classtuple->relfilenode))
+		{
+			if (!mapped_warning)
+				ereport(WARNING,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot change tablespace of indexes for mapped relations, skipping all")));
+			mapped_warning = true;
+			continue;
+		}
+
 		/* Save the list of relation OIDs in private context */
 		old = MemoryContextSwitchTo(private_context);
 
@@ -2679,7 +2740,7 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 
 		if (concurrent && get_rel_persistence(relid) != RELPERSISTENCE_TEMP)
 		{
-			(void) ReindexRelationConcurrently(relid, options);
+			(void) ReindexRelationConcurrently(relid, tablespaceOid, options);
 			/* ReindexRelationConcurrently() does the verbose output */
 		}
 		else
@@ -2687,6 +2748,7 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 			bool		result;
 
 			result = reindex_relation(relid,
+									  tablespaceOid,
 									  REINDEX_REL_PROCESS_TOAST |
 									  REINDEX_REL_CHECK_CONSTRAINTS,
 									  options | REINDEXOPT_REPORT_PROGRESS);
@@ -2719,6 +2781,9 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
  * itself will be rebuilt.  If 'relationOid' belongs to a partitioned table
  * then we issue a warning to mention these are not yet supported.
  *
+ * 'tablespaceOid' defines the new tablespace where the indexes of
+ * the relation will be rebuilt.
+ *
  * The locks taken on parent tables and involved indexes are kept until the
  * transaction is committed, at which point a session lock is taken on each
  * relation.  Both of these protect against concurrent schema changes.
@@ -2733,7 +2798,7 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
  * anyway, and a non-concurrent reindex is more efficient.
  */
 static bool
-ReindexRelationConcurrently(Oid relationOid, int options)
+ReindexRelationConcurrently(Oid relationOid, Oid tablespaceOid, int options)
 {
 	List	   *heapRelationIds = NIL;
 	List	   *indexIds = NIL;
@@ -2805,6 +2870,12 @@ ReindexRelationConcurrently(Oid relationOid, int options)
 
 				/* Open relation to get its indexes */
 				heapRelation = table_open(relationOid, ShareUpdateExclusiveLock);
+
+				if (OidIsValid(tablespaceOid) && RelationIsMapped(heapRelation))
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot change tablespace of indexes for mapped relation \"%s\"",
+									RelationGetRelationName(heapRelation))));
 
 				/* Add all the valid indexes of relation to list */
 				foreach(lc, RelationGetIndexList(heapRelation))
@@ -2978,6 +3049,12 @@ ReindexRelationConcurrently(Oid relationOid, int options)
 		if (indexRel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
 			elog(ERROR, "cannot reindex a temporary table concurrently");
 
+		if (OidIsValid(tablespaceOid) && RelationIsMapped(heapRel))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot change tablespace of mapped relation \"%s\"",
+							RelationGetRelationName(heapRel))));
+
 		pgstat_progress_start_command(PROGRESS_COMMAND_CREATE_INDEX,
 									  RelationGetRelid(heapRel));
 		pgstat_progress_update_param(PROGRESS_CREATEIDX_COMMAND,
@@ -2997,6 +3074,7 @@ ReindexRelationConcurrently(Oid relationOid, int options)
 		/* Create new index definition based on given index */
 		newIndexId = index_concurrently_create_copy(heapRel,
 													indexId,
+													tablespaceOid,
 													concurrentName);
 
 		/*
