@@ -370,6 +370,11 @@ pg_physical_replication_slot_advance(XLogRecPtr moveto)
 		MyReplicationSlot->data.restart_lsn = moveto;
 		SpinLockRelease(&MyReplicationSlot->mutex);
 		retlsn = moveto;
+
+		ReplicationSlotMarkDirty();
+
+		/* We moved retart_lsn, update the global value. */
+		ReplicationSlotsComputeRequiredLSN();
 	}
 
 	return retlsn;
@@ -564,7 +569,10 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 						(uint32) (moveto >> 32), (uint32) moveto,
 						(uint32) (minlsn >> 32), (uint32) minlsn)));
 
-	/* Do the actual slot update, depending on the slot type */
+	/*
+	 * Do the actual slot update, depending on the slot type.  Slot will be
+	 * marked as dirty by pg_*_replication_slot_advance if changed.
+	 */
 	if (OidIsValid(MyReplicationSlot->data.database))
 		endlsn = pg_logical_replication_slot_advance(moveto);
 	else
@@ -573,14 +581,11 @@ pg_replication_slot_advance(PG_FUNCTION_ARGS)
 	values[0] = NameGetDatum(&MyReplicationSlot->data.name);
 	nulls[0] = false;
 
-	/* Update the on disk state when lsn was updated. */
-	if (XLogRecPtrIsInvalid(endlsn))
-	{
-		ReplicationSlotMarkDirty();
-		ReplicationSlotsComputeRequiredXmin(false);
-		ReplicationSlotsComputeRequiredLSN();
-		ReplicationSlotSave();
-	}
+	/*
+	 * Update the on disk state.  No work here if
+	 * pg_*_replication_slot_advance call was a no-op.
+	 */
+	ReplicationSlotSave();
 
 	ReplicationSlotRelease();
 
