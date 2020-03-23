@@ -2474,6 +2474,7 @@ ExecReindex(ParseState *pstate, ReindexStmt *stmt, bool isTopLevel)
 	ListCell   *lc;
 	bool		concurrently = false;
 	bool		verbose = false;
+	char		*tablespace = NULL;
 
 	/* Parse option list */
 	foreach(lc, stmt->params)
@@ -2484,6 +2485,8 @@ ExecReindex(ParseState *pstate, ReindexStmt *stmt, bool isTopLevel)
 			verbose = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "concurrently") == 0)
 			concurrently = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "tablespace") == 0)
+			tablespace = defGetString(opt);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -2499,6 +2502,9 @@ ExecReindex(ParseState *pstate, ReindexStmt *stmt, bool isTopLevel)
 	params.options =
 		(verbose ? REINDEXOPT_VERBOSE : 0) |
 		(concurrently ? REINDEXOPT_CONCURRENTLY : 0);
+
+	params.tablespaceOid = tablespace != NULL ?
+		get_tablespace_oid(tablespace, false) : InvalidOid;
 
 	switch (stmt->kind)
 	{
@@ -2729,7 +2735,10 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 	MemoryContext old;
 	List	   *relids = NIL;
 	int			num_keys;
+
 	bool		concurrent_warning = false;
+	bool		tablespace_warning = false;
+	bool		mapped_warning = false;
 
 	AssertArg(objectName);
 	Assert(objectKind == REINDEX_OBJECT_SCHEMA ||
@@ -2856,6 +2865,35 @@ ReindexMultipleTables(const char *objectName, ReindexObjectType objectKind,
 			continue;
 		}
 
+		if (OidIsValid(params->tablespaceOid) &&
+			IsSystemClass(relid, classtuple))
+		{
+			if (!allowSystemTableMods)
+			{
+				/* Skip all system relations, if not allowSystemTableMods */
+				if (!tablespace_warning)
+					ereport(WARNING,
+							(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+							 errmsg("cannot change tablespace of indexes on system relations, skipping all")));
+				tablespace_warning = true;
+				continue;
+			}
+			else if (!OidIsValid(classtuple->relfilenode))
+			{
+				/*
+				 * Skip all mapped relations if TABLESPACE is specified.
+				 * OidIsValid(relfilenode) checks that, similar to
+				 * RelationIsMapped().
+				 */
+				if (!mapped_warning)
+					ereport(WARNING,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot change tablespace of indexes on mapped relations, skipping all")));
+				mapped_warning = true;
+				continue;
+			}
+		}
+
 		/* Save the list of relation OIDs in private context */
 		old = MemoryContextSwitchTo(private_context);
 
@@ -2926,6 +2964,19 @@ ReindexPartitions(Oid relid, ReindexParams *params, bool isTopLevel)
 	Assert(relkind == RELKIND_PARTITIONED_INDEX ||
 		   relkind == RELKIND_PARTITIONED_TABLE);
 
+	/* Check permissions except when using database's default */
+	if (OidIsValid(params->tablespaceOid)
+		&& params->tablespaceOid != MyDatabaseTableSpace)
+	{
+		AclResult	aclresult;
+
+		aclresult = pg_tablespace_aclcheck(params->tablespaceOid,
+										   GetUserId(), ACL_CREATE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_TABLESPACE,
+						   get_tablespace_name(params->tablespaceOid));
+	}
+
 	/*
 	 * Check if this runs in a transaction block, with an error callback to
 	 * provide more context under which a problem happens.
@@ -2969,9 +3020,27 @@ ReindexPartitions(Oid relid, ReindexParams *params, bool isTopLevel)
 		MemoryContext old_context;
 
 		/*
-		 * This discards partitioned tables, partitioned indexes and foreign
-		 * tables.
+		 * Foreign tables and partitioned relations are not themselves
+		 * reindexed - leaf partitions are processed directly.  But any
+		 * tablespace change is recorded in the catalog for partitioned
+		 * relations.
 		 */
+		if (partkind == RELKIND_PARTITIONED_INDEX)
+			(void) SetRelationTableSpace(partoid, params->tablespaceOid);
+		else if (partkind == RELKIND_PARTITIONED_TABLE)
+		{
+			Relation rel = table_open(partoid, ShareLock);
+			List	*indexIds = RelationGetIndexList(rel);
+			ListCell *lc;
+
+			table_close(rel, NoLock);
+			foreach (lc, indexIds)
+			{
+				Oid indexid = lfirst_oid(lc);
+				(void) SetRelationTableSpace(indexid, params->tablespaceOid);
+			}
+		}
+
 		if (!RELKIND_HAS_STORAGE(partkind))
 			continue;
 
@@ -3390,6 +3459,13 @@ ReindexRelationConcurrently(Oid relationOid, ReindexParams *params)
 		return false;
 	}
 
+	/* It's not a shared catalog, so refuse to move it to shared tablespace */
+	if (params->tablespaceOid == GLOBALTABLESPACE_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot move non-shared relation to tablespace \"%s\"",
+					 get_tablespace_name(params->tablespaceOid))));
+
 	Assert(heapRelationIds != NIL);
 
 	/*-----
@@ -3461,6 +3537,7 @@ ReindexRelationConcurrently(Oid relationOid, ReindexParams *params)
 		/* Create new index definition based on given index */
 		newIndexId = index_concurrently_create_copy(heapRel,
 													idx->indexId,
+													params->tablespaceOid,
 													concurrentName);
 
 		/*
