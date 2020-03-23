@@ -528,7 +528,7 @@ ProcessUtility(PlannedStmt *pstmt,
 
 /* Parse params not parsed by the grammar */
 static
-void parse_reindex_params(ParseState *pstate, ReindexStmt *stmt, int *options)
+void parse_reindex_params(ParseState *pstate, ReindexStmt *stmt, int *options, char **tablespace)
 {
 	ListCell *lc;
 	foreach(lc, stmt->params)
@@ -547,6 +547,8 @@ void parse_reindex_params(ParseState *pstate, ReindexStmt *stmt, int *options)
 				*options |= REINDEXOPT_CONCURRENTLY;
 			else
 				*options &= ~REINDEXOPT_CONCURRENTLY;
+		else if (strcmp(opt->defname, "tablespace") == 0)
+			*tablespace = defGetString(opt);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -949,8 +951,9 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				ReindexStmt *stmt = (ReindexStmt *) parsetree;
 				int options = 0;
+				char *tablespace = NULL;
 
-				parse_reindex_params(pstate, stmt, &options);
+				parse_reindex_params(pstate, stmt, &options, &tablespace);
 				if (options & REINDEXOPT_CONCURRENTLY)
 					PreventInTransactionBlock(isTopLevel,
 											  "REINDEX CONCURRENTLY");
@@ -958,12 +961,12 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				switch (stmt->kind)
 				{
 					case REINDEX_OBJECT_INDEX:
-						ReindexIndex(stmt->relation, stmt->options,
-									 isTopLevel);
+						ReindexIndex(stmt->relation, options,
+									 isTopLevel, tablespace);
 						break;
 					case REINDEX_OBJECT_TABLE:
-						ReindexTable(stmt->relation, stmt->options,
-									 isTopLevel);
+						ReindexTable(stmt->relation, options,
+									 isTopLevel, tablespace);
 						break;
 					case REINDEX_OBJECT_SCHEMA:
 					case REINDEX_OBJECT_SYSTEM:
@@ -979,7 +982,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 												  (stmt->kind == REINDEX_OBJECT_SCHEMA) ? "REINDEX SCHEMA" :
 												  (stmt->kind == REINDEX_OBJECT_SYSTEM) ? "REINDEX SYSTEM" :
 												  "REINDEX DATABASE");
-						ReindexMultipleTables(stmt->name, stmt->kind, options);
+						ReindexMultipleTables(stmt->name, stmt->kind, options, tablespace);
 						break;
 					default:
 						elog(ERROR, "unrecognized object type: %d",
