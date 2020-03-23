@@ -2138,6 +2138,7 @@ _equalReindexStmt(const ReindexStmt *a, const ReindexStmt *b)
 	COMPARE_SCALAR_FIELD(options);
 	COMPARE_NODE_FIELD(params);
 	COMPARE_SCALAR_FIELD(concurrent);
+	COMPARE_STRING_FIELD(tablespacename);
 
 	return true;
 }

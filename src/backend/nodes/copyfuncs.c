@@ -4453,6 +4453,7 @@ _copyReindexStmt(const ReindexStmt *from)
 	COPY_SCALAR_FIELD(options);
 	COPY_NODE_FIELD(params);
 	COPY_SCALAR_FIELD(concurrent);
+	COPY_STRING_FIELD(tablespacename);
 
 	return newnode;
 }

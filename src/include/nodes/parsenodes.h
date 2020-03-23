@@ -3372,6 +3372,7 @@ typedef struct ReindexStmt
 	int			options;		/* Reindex options flags */
 	List		*params;		/* Params not further parsed by the grammer */
 	bool		concurrent;		/* reindex concurrently? */
+	char	   *tablespacename; /* name of tablespace where index is to be rebuilt */
 } ReindexStmt;
 
 /* ----------------------
