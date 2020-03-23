@@ -542,6 +542,8 @@ void parse_reindex_params(ParseState *pstate, ReindexStmt *stmt)
 		}
 		else if (strcmp(opt->defname, "concurrently") == 0)
 			stmt->concurrent = true;
+		else if (strcmp(opt->defname, "tablespace") == 0)
+			stmt->tablespacename = defGetString(opt);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
