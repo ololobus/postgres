@@ -10460,8 +10460,9 @@ cluster_index_specification:
 /*****************************************************************************
  *
  *		QUERY:
- *				VACUUM
- *				ANALYZE
+ *				VACUUM [FULL] [FREEZE] [VERBOSE] [ANALYZE] [ <table_and_columns> [, ...] ]
+ *				VACUUM [(options)] [ <table_and_columns> [, ...] ]
+ *				ANALYZE [VERBOSE] [ <table_and_columns> [, ...] ]
  *
  *****************************************************************************/
 

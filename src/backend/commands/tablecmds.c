@@ -13195,8 +13195,9 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 	if (RelationIsMapped(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot move system relation \"%s\"",
-						RelationGetRelationName(rel))));
+				 errmsg("cannot change tablespace of mapped relation \"%s\"",
+					 RelationGetRelationName(rel))));
+
 
 	/* Can't move a non-shared relation into pg_global */
 	if (newTableSpace == GLOBALTABLESPACE_OID)
