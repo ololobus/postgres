@@ -27,6 +27,7 @@ CLUSTER [VERBOSE] [ ( <replaceable class="parameter">option</replaceable> [, ...
 <phrase>where <replaceable class="parameter">option</replaceable> can be one of:</phrase>
 
     VERBOSE [ <replaceable class="parameter">boolean</replaceable> ]
+    TABLESPACE <replaceable class="parameter">new_tablespace</replaceable>
 
 </synopsis>
  </refsynopsisdiv>
@@ -96,6 +97,15 @@ CLUSTER [VERBOSE] [ ( <replaceable class="parameter">option</replaceable> [, ...
    </varlistentry>
 
    <varlistentry>
+    <term><literal>TABLESPACE</literal></term>
+    <listitem>
+     <para>
+      Specifies that the table will be rebuilt on a new tablespace.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
     <term><replaceable class="parameter">table_name</replaceable></term>
     <listitem>
      <para>
@@ -123,6 +133,15 @@ CLUSTER [VERBOSE] [ ( <replaceable class="parameter">option</replaceable> [, ...
       <literal>OFF</literal>, or <literal>0</literal> to disable it.  The
       <replaceable class="parameter">boolean</replaceable> value can also
       be omitted, in which case <literal>TRUE</literal> is assumed.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><replaceable class="parameter">new_tablespace</replaceable></term>
+    <listitem>
+     <para>
+      The tablespace where the table will be rebuilt.
      </para>
     </listitem>
    </varlistentry>
