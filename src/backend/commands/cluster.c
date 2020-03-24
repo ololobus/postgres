@@ -33,11 +33,13 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/toasting.h"
 #include "commands/cluster.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
+#include "commands/tablespace.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
@@ -68,7 +70,7 @@ typedef struct
 } RelToCluster;
 
 
-static void rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose);
+static void rebuild_relation(Relation OldHeap, Oid indexOid, Oid NewTableSpaceOid, bool verbose);
 static void copy_table_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
 							bool verbose, bool *pSwapToastByContent,
 							TransactionId *pFreezeXid, MultiXactId *pCutoffMulti);
@@ -103,6 +105,9 @@ void
 cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 {
 	ListCell *lc;
+	/* Name and Oid of tablespace to use for clustered relation. */
+	char	*tablespaceName = NULL;
+	Oid tablespaceOid = InvalidOid;
 
 	/* Parse list of generic parameters not handled by the parser */
 	foreach(lc, stmt->params)
@@ -114,12 +119,27 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 				stmt->options |= CLUOPT_VERBOSE;
 			else
 				stmt->options &= ~CLUOPT_VERBOSE;
+		else if (strcmp(opt->defname, "tablespace") == 0)
+			tablespaceName = defGetString(opt);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("unrecognized CLUSTER option \"%s\"",
 						 opt->defname),
 					 parser_errposition(pstate, opt->location)));
+	}
+
+	/* Select tablespace Oid to use. */
+	if (tablespaceName)
+	{
+		tablespaceOid = get_tablespace_oid(tablespaceName, false);
+
+		/* Can't move a non-shared relation into pg_global */
+		if (tablespaceOid == GLOBALTABLESPACE_OID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot move non-shared relation to tablespace \"%s\"",
+							tablespaceName)));
 	}
 
 	if (stmt->relation != NULL)
@@ -191,7 +211,7 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 		table_close(rel, NoLock);
 
 		/* Do the job. */
-		cluster_rel(tableOid, indexOid, stmt->options);
+		cluster_rel(tableOid, indexOid, tablespaceOid, stmt->options);
 	}
 	else
 	{
@@ -239,7 +259,7 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 			/* functions in indexes may want a snapshot set */
 			PushActiveSnapshot(GetTransactionSnapshot());
 			/* Do the job. */
-			cluster_rel(rvtc->tableOid, rvtc->indexOid,
+			cluster_rel(rvtc->tableOid, rvtc->indexOid, tablespaceOid,
 						stmt->options | CLUOPT_RECHECK);
 			PopActiveSnapshot();
 			CommitTransactionCommand();
@@ -269,9 +289,12 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
  * If indexOid is InvalidOid, the table will be rewritten in physical order
  * instead of index order.  This is the new implementation of VACUUM FULL,
  * and error messages should refer to the operation as VACUUM not CLUSTER.
+ *
+ * "tablespaceOid" is the tablespace where the relation will be rebuilt, or
+ * InvalidOid to use its current tablespace.
  */
 void
-cluster_rel(Oid tableOid, Oid indexOid, int options)
+cluster_rel(Oid tableOid, Oid indexOid, Oid tablespaceOid, int options)
 {
 	Relation	OldHeap;
 	bool		verbose = ((options & CLUOPT_VERBOSE) != 0);
@@ -371,6 +394,23 @@ cluster_rel(Oid tableOid, Oid indexOid, int options)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot cluster a shared catalog")));
 
+	if (OidIsValid(tablespaceOid) &&
+		!allowSystemTableMods && IsSystemRelation(OldHeap))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				errmsg("permission denied: \"%s\" is a system catalog",
+						RelationGetRelationName(OldHeap))));
+
+	/*
+	 * We cannot support moving mapped relations into different tablespaces.
+	 * (In particular this eliminates all shared catalogs.)
+	 */
+	if (OidIsValid(tablespaceOid) && RelationIsMapped(OldHeap))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot change tablespace of mapped relation \"%s\"",
+						RelationGetRelationName(OldHeap))));
+
 	/*
 	 * Don't process temp tables of other backends ... their local buffer
 	 * manager is not going to cope.
@@ -421,7 +461,7 @@ cluster_rel(Oid tableOid, Oid indexOid, int options)
 	TransferPredicateLocksToHeapRelation(OldHeap);
 
 	/* rebuild_relation does all the dirty work */
-	rebuild_relation(OldHeap, indexOid, verbose);
+	rebuild_relation(OldHeap, indexOid, tablespaceOid, verbose);
 
 	/* NB: rebuild_relation does table_close() on OldHeap */
 
@@ -570,7 +610,7 @@ mark_index_clustered(Relation rel, Oid indexOid, bool is_internal)
  * NB: this routine closes OldHeap at the right time; caller should not.
  */
 static void
-rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
+rebuild_relation(Relation OldHeap, Oid indexOid, Oid NewTablespaceOid, bool verbose)
 {
 	Oid			tableOid = RelationGetRelid(OldHeap);
 	Oid			tableSpace = OldHeap->rd_rel->reltablespace;
@@ -580,6 +620,10 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
 	bool		swap_toast_by_content;
 	TransactionId frozenXid;
 	MultiXactId cutoffMulti;
+
+	/* Use new tablespace if passed. */
+	if (OidIsValid(NewTablespaceOid))
+		tableSpace = NewTablespaceOid;
 
 	/* Mark the correct index as clustered */
 	if (OidIsValid(indexOid))
@@ -1024,6 +1068,13 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 		 * relpersistence
 		 */
 		Assert(!target_is_pg_class);
+
+		if (!allowSystemTableMods && IsSystemClass(r1, relform1) &&
+			relform1->reltablespace != relform2->reltablespace)
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permission denied: \"%s\" is a system catalog",
+							get_rel_name(r1))));
 
 		swaptemp = relform1->relfilenode;
 		relform1->relfilenode = relform2->relfilenode;
