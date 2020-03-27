@@ -35,6 +35,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/toasting.h"
 #include "commands/cluster.h"
+#include "commands/defrem.h"
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
 #include "commands/vacuum.h"
@@ -99,8 +100,28 @@ static List *get_tables_to_cluster(MemoryContext cluster_context);
  *---------------------------------------------------------------------------
  */
 void
-cluster(ClusterStmt *stmt, bool isTopLevel)
+cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 {
+	ListCell *lc;
+
+	/* Parse list of generic parameters not handled by the parser */
+	foreach(lc, stmt->params)
+	{
+		DefElem	*opt = (DefElem *) lfirst(lc);
+
+		if (strcmp(opt->defname, "verbose") == 0)
+			if (defGetBoolean(opt))
+				stmt->options |= CLUOPT_VERBOSE;
+			else
+				stmt->options &= ~CLUOPT_VERBOSE;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unrecognized CLUSTER option \"%s\"",
+						 opt->defname),
+					 parser_errposition(pstate, opt->location)));
+	}
+
 	if (stmt->relation != NULL)
 	{
 		/* This is the single-relation case. */
