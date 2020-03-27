@@ -526,6 +526,36 @@ ProcessUtility(PlannedStmt *pstmt,
 								dest, qc);
 }
 
+/* Parse params not parsed by the grammar */
+static
+void parse_reindex_params(ParseState *pstate, ReindexStmt *stmt, int *options)
+{
+	ListCell *lc;
+	foreach(lc, stmt->params)
+	{
+		DefElem    *opt = (DefElem *) lfirst(lc);
+
+		if (strcmp(opt->defname, "verbose") == 0)
+		{
+			if (defGetBoolean(opt))
+				*options |= REINDEXOPT_VERBOSE;
+			else
+				*options &= ~REINDEXOPT_VERBOSE;
+		}
+		else if (strcmp(opt->defname, "concurrently") == 0)
+			if (defGetBoolean(opt))
+				*options |= REINDEXOPT_CONCURRENTLY;
+			else
+				*options &= ~REINDEXOPT_CONCURRENTLY;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unrecognized REINDEX option \"%s\"",
+						 opt->defname),
+					 parser_errposition(pstate, opt->location)));
+	}
+}
+
 /*
  * standard_ProcessUtility itself deals only with utility commands for
  * which we do not provide event trigger support.  Commands that do have
@@ -818,7 +848,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			break;
 
 		case T_ClusterStmt:
-			cluster((ClusterStmt *) parsetree, isTopLevel);
+			cluster(pstate, (ClusterStmt *) parsetree, isTopLevel);
 			break;
 
 		case T_VacuumStmt:
@@ -918,20 +948,20 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_ReindexStmt:
 			{
 				ReindexStmt *stmt = (ReindexStmt *) parsetree;
+				int options = 0;
 
-				if ((stmt->options & REINDEXOPT_CONCURRENTLY) != 0)
+				parse_reindex_params(pstate, stmt, &options);
+				if (options & REINDEXOPT_CONCURRENTLY)
 					PreventInTransactionBlock(isTopLevel,
 											  "REINDEX CONCURRENTLY");
 
 				switch (stmt->kind)
 				{
 					case REINDEX_OBJECT_INDEX:
-						ReindexIndex(stmt->relation, stmt->options,
-									 isTopLevel);
+						ReindexIndex(stmt->relation, options, isTopLevel);
 						break;
 					case REINDEX_OBJECT_TABLE:
-						ReindexTable(stmt->relation, stmt->options,
-									 isTopLevel);
+						ReindexTable(stmt->relation, options, isTopLevel);
 						break;
 					case REINDEX_OBJECT_SCHEMA:
 					case REINDEX_OBJECT_SYSTEM:
@@ -947,7 +977,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 												  (stmt->kind == REINDEX_OBJECT_SCHEMA) ? "REINDEX SCHEMA" :
 												  (stmt->kind == REINDEX_OBJECT_SYSTEM) ? "REINDEX SYSTEM" :
 												  "REINDEX DATABASE");
-						ReindexMultipleTables(stmt->name, stmt->kind, stmt->options);
+						ReindexMultipleTables(stmt->name, stmt->kind, options);
 						break;
 					default:
 						elog(ERROR, "unrecognized object type: %d",
