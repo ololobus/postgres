@@ -35,6 +35,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/toasting.h"
 #include "commands/cluster.h"
+#include "commands/defrem.h"
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
 #include "commands/vacuum.h"
@@ -102,8 +103,29 @@ static List *get_tables_to_cluster(MemoryContext cluster_context);
  *---------------------------------------------------------------------------
  */
 void
-cluster(ClusterStmt *stmt, bool isTopLevel)
+cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 {
+	ListCell	*lc;
+	int			options = 0;
+
+	/* Parse list of generic parameters not handled by the parser */
+	foreach(lc, stmt->params)
+	{
+		DefElem	*opt = (DefElem *) lfirst(lc);
+
+		if (strcmp(opt->defname, "verbose") == 0)
+			if (defGetBoolean(opt))
+				options |= CLUOPT_VERBOSE;
+			else
+				options &= ~CLUOPT_VERBOSE;
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("unrecognized CLUSTER option \"%s\"",
+						 opt->defname),
+					 parser_errposition(pstate, opt->location)));
+	}
+
 	if (stmt->relation != NULL)
 	{
 		/* This is the single-relation case. */
@@ -173,7 +195,7 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 		table_close(rel, NoLock);
 
 		/* Do the job. */
-		cluster_rel(tableOid, indexOid, stmt->options, isTopLevel);
+		cluster_rel(tableOid, indexOid, options, isTopLevel);
 	}
 	else
 	{
@@ -222,7 +244,7 @@ cluster(ClusterStmt *stmt, bool isTopLevel)
 			PushActiveSnapshot(GetTransactionSnapshot());
 			/* Do the job. */
 			cluster_rel(rvtc->tableOid, rvtc->indexOid,
-						stmt->options | CLUOPT_RECHECK,
+						options | CLUOPT_RECHECK,
 						isTopLevel);
 			PopActiveSnapshot();
 			CommitTransactionCommand();

@@ -14,11 +14,12 @@
 #define CLUSTER_H
 
 #include "nodes/parsenodes.h"
+#include "parser/parse_node.h"
 #include "storage/lock.h"
 #include "utils/relcache.h"
 
 
-extern void cluster(ClusterStmt *stmt, bool isTopLevel);
+extern void cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel);
 extern void cluster_rel(Oid tableOid, Oid indexOid, int options,
 						bool isTopLevel);
 extern void check_index_is_clusterable(Relation OldHeap, Oid indexOid,
