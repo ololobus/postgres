@@ -72,7 +72,7 @@ typedef struct
 
 static void rebuild_relation(Relation OldHeap, Oid indexOid,
 							 bool isTopLevel, bool verbose,
-							 Oid NewTableSpaceOid);
+							 Oid NewTableSpaceOid, Oid NewIdxTableSpaceOid);
 static void copy_table_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
 							bool isTopLevel, bool verbose,
 							bool *pSwapToastByContent,
@@ -110,9 +110,11 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 {
 	ListCell	*lc;
 	int			options = 0;
-	/* Name and Oid of tablespace to use for clustered relation. */
-	char		*tablespaceName = NULL;
-	Oid			tablespaceOid = InvalidOid;
+	/* Name and Oid of tablespaces to use for clustered relations. */
+	char		*tablespaceName = NULL,
+				*idxtablespaceName = NULL;
+	Oid			tablespaceOid,
+				idxtablespaceOid;
 
 	/* Parse list of generic parameters not handled by the parser */
 	foreach(lc, stmt->params)
@@ -126,6 +128,8 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 				options &= ~CLUOPT_VERBOSE;
 		else if (strcmp(opt->defname, "tablespace") == 0)
 			tablespaceName = defGetString(opt);
+		else if (strcmp(opt->defname, "index_tablespace") == 0)
+			idxtablespaceName = defGetString(opt);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -134,18 +138,11 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 					 parser_errposition(pstate, opt->location)));
 	}
 
-	/* Select tablespace Oid to use. */
-	if (tablespaceName)
-	{
-		tablespaceOid = get_tablespace_oid(tablespaceName, false);
-
-		/* Can't move a non-shared relation into pg_global */
-		if (tablespaceOid == GLOBALTABLESPACE_OID)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot move non-shared relation to tablespace \"%s\"",
-							tablespaceName)));
-	}
+	/* Get tablespaces to use. */
+	tablespaceOid = tablespaceName ?
+		get_tablespace_oid(tablespaceName, false) : InvalidOid;
+	idxtablespaceOid = idxtablespaceName ?
+		get_tablespace_oid(idxtablespaceName, false) : InvalidOid;
 
 	if (stmt->relation != NULL)
 	{
@@ -217,7 +214,7 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 
 		/* Do the job. */
 		cluster_rel(tableOid, indexOid, options, isTopLevel,
-				tablespaceOid);
+				tablespaceOid, idxtablespaceOid);
 	}
 	else
 	{
@@ -267,7 +264,7 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
 			/* Do the job. */
 			cluster_rel(rvtc->tableOid, rvtc->indexOid,
 						options | CLUOPT_RECHECK,
-						isTopLevel, tablespaceOid);
+						isTopLevel, tablespaceOid, idxtablespaceOid);
 			PopActiveSnapshot();
 			CommitTransactionCommand();
 		}
@@ -297,11 +294,12 @@ cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel)
  * instead of index order.  This is the new implementation of VACUUM FULL,
  * and error messages should refer to the operation as VACUUM not CLUSTER.
  *
- * "tablespaceOid" is the tablespace where the relation will be rebuilt, or
- * InvalidOid to use its current tablespace.
+ * "tablespaceOid" and "idxtablespaceOid" are the tablespaces where the relation
+ * and its indexes will be rebuilt, or InvalidOid to use their current
+ * tablespaces.
  */
 void
-cluster_rel(Oid tableOid, Oid indexOid, int options, bool isTopLevel, Oid tablespaceOid)
+cluster_rel(Oid tableOid, Oid indexOid, int options, bool isTopLevel, Oid tablespaceOid, Oid idxtablespaceOid)
 {
 	Relation	OldHeap;
 	bool		verbose = ((options & CLUOPT_VERBOSE) != 0);
@@ -469,7 +467,7 @@ cluster_rel(Oid tableOid, Oid indexOid, int options, bool isTopLevel, Oid tables
 
 	/* rebuild_relation does all the dirty work */
 	rebuild_relation(OldHeap, indexOid, isTopLevel, verbose,
-			tablespaceOid);
+			tablespaceOid, idxtablespaceOid);
 
 	/* NB: rebuild_relation does table_close() on OldHeap */
 
@@ -619,10 +617,11 @@ mark_index_clustered(Relation rel, Oid indexOid, bool is_internal)
  * NB: this routine closes OldHeap at the right time; caller should not.
  */
 static void
-rebuild_relation(Relation OldHeap, Oid indexOid, bool isTopLevel, bool verbose, Oid NewTablespaceOid)
+rebuild_relation(Relation OldHeap, Oid indexOid, bool isTopLevel, bool verbose, Oid NewTablespaceOid, Oid NewIdxTablespaceOid)
 {
 	Oid			tableOid = RelationGetRelid(OldHeap);
 	Oid			tableSpace = OldHeap->rd_rel->reltablespace;
+	Oid			idxtableSpace;
 	Oid			OIDNewHeap;
 	char		relpersistence;
 	bool		is_system_catalog;
@@ -632,7 +631,20 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool isTopLevel, bool verbose, 
 
 	/* Use new tablespace if passed. */
 	if (OidIsValid(NewTablespaceOid))
+	{
 		tableSpace = NewTablespaceOid;
+		/* It's not a shared catalog, so refuse to move it to shared tablespace */
+		if (tableSpace == GLOBALTABLESPACE_OID)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot move non-shared relation to tablespace \"%s\"",
+							get_tablespace_name(tableSpace))));
+	}
+
+	if (OidIsValid(NewIdxTablespaceOid))
+		idxtableSpace = NewIdxTablespaceOid;
+	else
+		idxtableSpace = get_rel_tablespace(indexOid);
 
 	/* Mark the correct index as clustered */
 	if (OidIsValid(indexOid))
@@ -661,7 +673,7 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool isTopLevel, bool verbose, 
 	finish_heap_swap(tableOid, OIDNewHeap, is_system_catalog,
 					 swap_toast_by_content, false, true,
 					 frozenXid, cutoffMulti,
-					 relpersistence);
+					 relpersistence, idxtableSpace);
 }
 
 
@@ -1410,7 +1422,7 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 				 bool is_internal,
 				 TransactionId frozenXid,
 				 MultiXactId cutoffMulti,
-				 char newrelpersistence)
+				 char newrelpersistence, Oid idxtableSpace)
 {
 	ObjectAddress object;
 	Oid			mapped_tables[4];
@@ -1472,7 +1484,7 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,
 								 PROGRESS_CLUSTER_PHASE_REBUILD_INDEX);
 
-	reindex_relation(OIDOldHeap, reindex_flags, 0, InvalidOid);
+	reindex_relation(OIDOldHeap, reindex_flags, 0, idxtableSpace);
 
 	/* Report that we are now doing clean up */
 	pgstat_progress_update_param(PROGRESS_CLUSTER_PHASE,

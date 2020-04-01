@@ -21,7 +21,8 @@
 
 extern void cluster(ParseState *pstate, ClusterStmt *stmt, bool isTopLevel);
 extern void cluster_rel(Oid tableOid, Oid indexOid, int options,
-						bool isTopLevel, Oid tablespaceOid);
+						bool isTopLevel, Oid tablespaceOid,
+						Oid indextablespaceOid);
 extern void check_index_is_clusterable(Relation OldHeap, Oid indexOid,
 									   bool recheck, LOCKMODE lockmode);
 extern void mark_index_clustered(Relation rel, Oid indexOid, bool is_internal);
@@ -35,6 +36,7 @@ extern void finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 							 bool is_internal,
 							 TransactionId frozenXid,
 							 MultiXactId minMulti,
-							 char newrelpersistence);
+							 char newrelpersistence,
+							 Oid idxtablespaceOid);
 
 #endif							/* CLUSTER_H */
