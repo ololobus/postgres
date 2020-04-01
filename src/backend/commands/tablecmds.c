@@ -4917,7 +4917,7 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 							 !OidIsValid(tab->newTableSpace),
 							 RecentXmin,
 							 ReadNextMultiXactId(),
-							 persistence);
+							 persistence, InvalidOid);
 		}
 		else
 		{

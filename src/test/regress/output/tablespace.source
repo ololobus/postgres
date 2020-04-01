@@ -103,6 +103,26 @@ WHERE reltablespace=(SELECT oid FROM pg_tablespace WHERE spcname='regress_tblspa
 ---------
 (0 rows)
 
+-- check CLUSTER with INDEX_TABLESPACE change to non-default location
+CLUSTER (INDEX_TABLESPACE regress_tblspace) regress_tblspace_test_tbl USING regress_tblspace_test_tbl_idx; -- ok
+-- check relations moved to new tablespace
+SELECT relname FROM pg_class
+WHERE reltablespace=(SELECT oid FROM pg_tablespace WHERE spcname='regress_tblspace')
+ORDER BY relname;
+            relname            
+-------------------------------
+ regress_tblspace_test_tbl_idx
+(1 row)
+
+-- check VACUUM with INDEX_TABLESPACE change
+VACUUM (FULL, ANALYSE, FREEZE, INDEX_TABLESPACE pg_default) regress_tblspace_test_tbl; -- ok
+-- check relations moved back to pg_default
+SELECT relname FROM pg_class
+WHERE reltablespace=(SELECT oid FROM pg_tablespace WHERE spcname='regress_tblspace');
+ relname 
+---------
+(0 rows)
+
 -- create a schema we can use
 CREATE SCHEMA testschema;
 -- try a table
