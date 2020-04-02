@@ -3414,7 +3414,7 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH("DATA");
 
 /* REINDEX */
-	else if (Matches("REINDEX"))
+	else if (Matches("REINDEX") || Matches("REINDEX", "(*)"))
 		COMPLETE_WITH("TABLE", "INDEX", "SYSTEM", "SCHEMA", "DATABASE");
 	else if (Matches("REINDEX", "TABLE"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexables,
@@ -3436,6 +3436,17 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH_QUERY(Query_for_list_of_schemas);
 	else if (Matches("REINDEX", "SYSTEM|DATABASE", "CONCURRENTLY"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_databases);
+	else if (HeadMatches("REINDEX", "(*") &&
+			 !HeadMatches("REINDEX", "(*)"))
+	{
+		/*
+		 * This fires if we're in an unfinished parenthesized option list.
+		 * get_previous_words treats a completed parenthesized option list as
+		 * one word, so the above test is correct.
+		 */
+		if (ends_with(prev_wd, '(') || ends_with(prev_wd, ','))
+			COMPLETE_WITH("VERBOSE");
+	}
 
 /* SECURITY LABEL */
 	else if (Matches("SECURITY"))
