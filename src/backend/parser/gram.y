@@ -315,10 +315,10 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 				create_extension_opt_item alter_extension_opt_item
 
 %type <ival>	opt_lock lock_type cast_context
-%type <str>		vac_analyze_option_name
-%type <defelt>	vac_analyze_option_elem
-%type <list>	vac_analyze_option_list
-%type <node>	vac_analyze_option_arg
+%type <str>		common_option_name
+%type <defelt>	common_option_elem
+%type <list>	common_option_list
+%type <node>	common_option_arg
 %type <defelt>	drop_option
 %type <boolean>	opt_or_replace opt_no
 				opt_grant_grant_option opt_grant_admin_option
@@ -513,10 +513,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <node>	generic_option_arg
 %type <defelt>	generic_option_elem alter_generic_option_elem
 %type <list>	generic_option_list alter_generic_option_list
-%type <str>		explain_option_name
-%type <node>	explain_option_arg
-%type <defelt>	explain_option_elem
-%type <list>	explain_option_list
 
 %type <ival>	reindex_target_type reindex_target_multitable
 
@@ -8193,7 +8189,7 @@ ReindexStmt:
 								makeDefElem("concurrently", NULL, @3));
 					$$ = (Node *)n;
 				}
-			| REINDEX '(' vac_analyze_option_list ')' reindex_target_type opt_concurrently qualified_name
+			| REINDEX '(' common_option_list ')' reindex_target_type opt_concurrently qualified_name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
 					n->kind = $5;
@@ -8205,7 +8201,7 @@ ReindexStmt:
 								makeDefElem("concurrently", NULL, @6));
 					$$ = (Node *)n;
 				}
-			| REINDEX '(' vac_analyze_option_list ')' reindex_target_multitable opt_concurrently name
+			| REINDEX '(' common_option_list ')' reindex_target_multitable opt_concurrently name
 				{
 					ReindexStmt *n = makeNode(ReindexStmt);
 					n->kind = $5;
@@ -10395,7 +10391,7 @@ ClusterStmt:
 					$$ = (Node*)n;
 				}
 
-			| CLUSTER '(' vac_analyze_option_list ')' qualified_name cluster_index_specification
+			| CLUSTER '(' common_option_list ')' qualified_name cluster_index_specification
 				{
 					ClusterStmt *n = makeNode(ClusterStmt);
 					n->relation = $5;
@@ -10461,7 +10457,7 @@ VacuumStmt: VACUUM opt_full opt_freeze opt_verbose opt_analyze opt_vacuum_relati
 					n->is_vacuumcmd = true;
 					$$ = (Node *)n;
 				}
-			| VACUUM '(' vac_analyze_option_list ')' opt_vacuum_relation_list
+			| VACUUM '(' common_option_list ')' opt_vacuum_relation_list
 				{
 					VacuumStmt *n = makeNode(VacuumStmt);
 					n->options = $3;
@@ -10482,7 +10478,7 @@ AnalyzeStmt: analyze_keyword opt_verbose opt_vacuum_relation_list
 					n->is_vacuumcmd = false;
 					$$ = (Node *)n;
 				}
-			| analyze_keyword '(' vac_analyze_option_list ')' opt_vacuum_relation_list
+			| analyze_keyword '(' common_option_list ')' opt_vacuum_relation_list
 				{
 					VacuumStmt *n = makeNode(VacuumStmt);
 					n->options = $3;
@@ -10492,12 +10488,12 @@ AnalyzeStmt: analyze_keyword opt_verbose opt_vacuum_relation_list
 				}
 		;
 
-vac_analyze_option_list:
-			vac_analyze_option_elem
+common_option_list:
+			common_option_elem
 				{
 					$$ = list_make1($1);
 				}
-			| vac_analyze_option_list ',' vac_analyze_option_elem
+			| common_option_list ',' common_option_elem
 				{
 					$$ = lappend($1, $3);
 				}
@@ -10508,19 +10504,19 @@ analyze_keyword:
 			| ANALYSE /* British */					{}
 		;
 
-vac_analyze_option_elem:
-			vac_analyze_option_name vac_analyze_option_arg
+common_option_elem:
+			common_option_name common_option_arg
 				{
 					$$ = makeDefElem($1, $2, @1);
 				}
 		;
 
-vac_analyze_option_name:
+common_option_name:
 			NonReservedWord							{ $$ = $1; }
 			| analyze_keyword						{ $$ = "analyze"; }
 		;
 
-vac_analyze_option_arg:
+common_option_arg:
 			opt_boolean_or_string					{ $$ = (Node *) makeString($1); }
 			| NumericOnly			{ $$ = (Node *) $1; }
 			| /* EMPTY */		 					{ $$ = NULL; }
@@ -10602,7 +10598,7 @@ ExplainStmt:
 					n->options = list_make1(makeDefElem("verbose", NULL, @2));
 					$$ = (Node *) n;
 				}
-		| EXPLAIN '(' explain_option_list ')' ExplainableStmt
+		| EXPLAIN '(' common_option_list ')' ExplainableStmt
 				{
 					ExplainStmt *n = makeNode(ExplainStmt);
 					n->query = $5;
@@ -10621,35 +10617,6 @@ ExplainableStmt:
 			| CreateMatViewStmt
 			| RefreshMatViewStmt
 			| ExecuteStmt					/* by default all are $$=$1 */
-		;
-
-explain_option_list:
-			explain_option_elem
-				{
-					$$ = list_make1($1);
-				}
-			| explain_option_list ',' explain_option_elem
-				{
-					$$ = lappend($1, $3);
-				}
-		;
-
-explain_option_elem:
-			explain_option_name explain_option_arg
-				{
-					$$ = makeDefElem($1, $2, @1);
-				}
-		;
-
-explain_option_name:
-			NonReservedWord			{ $$ = $1; }
-			| analyze_keyword		{ $$ = "analyze"; }
-		;
-
-explain_option_arg:
-			opt_boolean_or_string	{ $$ = (Node *) makeString($1); }
-			| NumericOnly			{ $$ = (Node *) $1; }
-			| /* EMPTY */			{ $$ = NULL; }
 		;
 
 /*****************************************************************************
