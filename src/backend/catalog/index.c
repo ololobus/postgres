@@ -3437,7 +3437,6 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	Relation	iRel,
 				heapRelation;
 	Oid			heapId;
-	Oid			oldTablespaceOid;
 	IndexInfo  *indexInfo;
 	volatile bool skipped_constraint = false;
 	PGRUsage	ru0;
@@ -3553,41 +3552,17 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 		tablespaceOid = InvalidOid;
 
 	/*
-	 * Set the new tablespace for the relation.  Do that only in the
-	 * case where the reindex caller wishes to enforce a new tablespace.
+	 * Set the new tablespace for the relation if requested.
 	 */
-	oldTablespaceOid = iRel->rd_rel->reltablespace;
 	if (set_tablespace &&
-		(tablespaceOid != oldTablespaceOid ||
-		(tablespaceOid == MyDatabaseTableSpace && OidIsValid(oldTablespaceOid))))
+		set_rel_tablespace(indexId, tablespaceOid))
 	{
-		Relation		pg_class;
-		Form_pg_class	rd_rel;
-		HeapTuple		tuple;
-
-		/* First get a modifiable copy of the relation's pg_class row */
-		pg_class = table_open(RelationRelationId, RowExclusiveLock);
-
-		tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(indexId));
-		if (!HeapTupleIsValid(tuple))
-			elog(ERROR, "cache lookup failed for relation %u", indexId);
-		rd_rel = (Form_pg_class) GETSTRUCT(tuple);
-
 		/*
 		 * Mark the relation as ready to be dropped at transaction commit,
 		 * before making visible the new tablespace change so as this won't
 		 * miss things.
 		 */
 		RelationDropStorage(iRel);
-
-		/* Update the pg_class row */
-		rd_rel->reltablespace = tablespaceOid;
-		CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
-
-		heap_freetuple(tuple);
-
-		table_close(pg_class, RowExclusiveLock);
-
 		RelationAssumeNewRelfilenode(iRel);
 
 		/* Make sure the reltablespace change is visible */
@@ -3890,6 +3865,51 @@ reindex_relation(Oid relid, int flags, int options, Oid tablespaceOid)
 	return result;
 }
 
+/*
+ * set_rel_tablespace - modify relation tablespace in the pg_class entry.
+ *
+ * 'reloid' is an Oid of relation to be modified.
+ * 'tablespaceOid' is an Oid of new tablespace.
+ *
+ * Catalog modification is done only if tablespaceOid is different from
+ * the currently set.  Returned bool value is indicating whether any changes
+ * were made or not.
+ */
+bool
+set_rel_tablespace(Oid reloid, Oid tablespaceOid)
+{
+	Relation		pg_class;
+	HeapTuple		tuple;
+	Form_pg_class	rd_rel;
+	bool			changed = false;
+	Oid			oldTablespaceOid;
+
+	/* Get a modifiable copy of the relation's pg_class row. */
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+
+	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(reloid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", reloid);
+	rd_rel = (Form_pg_class) GETSTRUCT(tuple);
+
+	/* No work if no change in tablespace. */
+	oldTablespaceOid = rd_rel->reltablespace;
+	if (tablespaceOid != oldTablespaceOid ||
+		(tablespaceOid == MyDatabaseTableSpace && OidIsValid(oldTablespaceOid)))
+	{
+		/* Update the pg_class row. */
+		rd_rel->reltablespace = (tablespaceOid == MyDatabaseTableSpace) ?
+			InvalidOid : tablespaceOid;
+		CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
+
+		changed = true;
+	}
+
+	heap_freetuple(tuple);
+	table_close(pg_class, RowExclusiveLock);
+
+	return changed;
+}
 
 /* ----------------------------------------------------------------
  *		System index reindexing support
