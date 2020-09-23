@@ -140,6 +140,8 @@ extern Oid	IndexGetRelation(Oid indexId, bool missing_ok);
 extern void reindex_index(Oid indexId, bool skip_constraint_checks,
 						  char relpersistence, int options, Oid tablespaceOid);
 
+extern bool set_rel_tablespace(Oid reloid, Oid tablespaceOid);
+
 /* Flag bits for reindex_relation(): */
 #define REINDEX_REL_PROCESS_TOAST			0x01
 #define REINDEX_REL_SUPPRESS_INDEX_USE		0x02

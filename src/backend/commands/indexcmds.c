@@ -2856,41 +2856,6 @@ reindex_error_callback(void *arg)
 }
 
 /*
- * This is mostly duplicating ATExecSetTableSpaceNoStorage,
- * which should maybe be factored out to a library function.
- */
-static void
-set_rel_tablespace(Oid reloid, Oid tablespaceOid)
-{
-	Relation		pg_class;
-	HeapTuple		tuple;
-	Form_pg_class	rd_rel;
-	Oid			oldTablespaceOid;
-
-	/* Get a modifiable copy of the relation's pg_class row */
-	pg_class = table_open(RelationRelationId, RowExclusiveLock);
-
-	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(reloid));
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for relation %u", reloid);
-	rd_rel = (Form_pg_class) GETSTRUCT(tuple);
-
-	/* No work if no change in tablespace. */
-	oldTablespaceOid = rd_rel->reltablespace;
-	if (tablespaceOid != oldTablespaceOid ||
-		(tablespaceOid == MyDatabaseTableSpace && OidIsValid(oldTablespaceOid)))
-	{
-		/* Update the pg_class row */
-		rd_rel->reltablespace = (tablespaceOid == MyDatabaseTableSpace) ?
-			InvalidOid : tablespaceOid;
-		CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
-	}
-
-	heap_freetuple(tuple);
-	table_close(pg_class, RowExclusiveLock);
-}
-
-/*
  * ReindexPartitions
  *
  * Reindex a set of partitions, per the partitioned index or table given
@@ -2963,7 +2928,7 @@ ReindexPartitions(Oid relid, int options, bool isTopLevel, char *tablespace)
 		 * relations.
 		 */
 		if (partkind == RELKIND_PARTITIONED_INDEX)
-			set_rel_tablespace(partoid, tablespaceOid);
+			(void) set_rel_tablespace(partoid, tablespaceOid);
 		else if (partkind == RELKIND_PARTITIONED_TABLE)
 		{
 			Relation rel = table_open(partoid, ShareLock);
@@ -2974,7 +2939,7 @@ ReindexPartitions(Oid relid, int options, bool isTopLevel, char *tablespace)
 			foreach (lc, indexIds)
 			{
 				Oid indexid = lfirst_oid(lc);
-				set_rel_tablespace(indexid, tablespaceOid);
+				(void) set_rel_tablespace(indexid, tablespaceOid);
 			}
 		}
 
