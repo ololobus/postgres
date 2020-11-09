@@ -231,7 +231,7 @@ autoprewarm_main(Datum main_arg)
 											autoprewarm_interval * 1000);
 			TimestampDifference(GetCurrentTimestamp(), next_dump_time,
 								&secs, &usecs);
-			delay_in_ms = secs + (usecs / 1000);
+			delay_in_ms = secs * 1000 + (usecs / 1000);
 
 			/* Perform a dump if it's time. */
 			if (delay_in_ms <= 0)
