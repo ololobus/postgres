@@ -238,7 +238,9 @@ autoprewarm_main(Datum main_arg)
 			{
 				last_dump_time = GetCurrentTimestamp();
 				apw_dump_now(true, false);
-				continue;
+
+				/* We have to sleep even after a successfull dump */
+				delay_in_ms = autoprewarm_interval * 1000;
 			}
 
 			/* Sleep until the next dump time. */
