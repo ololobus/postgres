@@ -28,6 +28,8 @@
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 
+#include "postgres_fdw.h"
+
 /*
  * Connection cache hash table entry
  *
@@ -948,6 +950,7 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 		 */
 		if (PQstatus(entry->conn) != CONNECTION_OK ||
 			PQtransactionStatus(entry->conn) != PQTRANS_IDLE ||
+			!keep_connections ||
 			entry->changing_xact_state)
 		{
 			elog(DEBUG3, "discarding connection %p", entry->conn);
