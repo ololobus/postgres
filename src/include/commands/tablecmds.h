@@ -61,6 +61,8 @@ extern void ExecuteTruncateGuts(List *explicit_rels, List *relids, List *relids_
 
 extern void SetRelationHasSubclass(Oid relationId, bool relhassubclass);
 
+extern bool SetRelationTableSpace(Oid reloid, Oid tablespaceOid);
+
 extern ObjectAddress renameatt(RenameStmt *stmt);
 
 extern ObjectAddress RenameConstraint(RenameStmt *stmt);

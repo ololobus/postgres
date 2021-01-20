@@ -13292,6 +13292,59 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 }
 
 /*
+ * SetRelationTableSpace - modify relation tablespace in the pg_class entry.
+ *
+ * 'reloid' is an Oid of relation to be modified.
+ * 'tablespaceOid' is an Oid of new tablespace.
+ *
+ * Catalog modification is done only if tablespaceOid is different from
+ * the currently set.  Returned bool value is indicating whether any changes
+ * were made or not.  Note that caller is responsible for doing
+ * CommandCounterIncrement() to make tablespace changes visible.
+ */
+bool
+SetRelationTableSpace(Oid reloid, Oid tablespaceOid)
+{
+	Relation	pg_class;
+	HeapTuple	tuple;
+	Form_pg_class rd_rel;
+	bool		changed = false;
+
+	/* Get a modifiable copy of the relation's pg_class row. */
+	pg_class = table_open(RelationRelationId, RowExclusiveLock);
+
+	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(reloid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", reloid);
+	rd_rel = (Form_pg_class) GETSTRUCT(tuple);
+
+	/* MyDatabaseTableSpace is stored as InvalidOid. */
+	if (tablespaceOid == MyDatabaseTableSpace)
+		tablespaceOid = InvalidOid;
+
+	/* No work if no change in tablespace. */
+	if (tablespaceOid != rd_rel->reltablespace)
+	{
+		/* Update the pg_class row. */
+		rd_rel->reltablespace = tablespaceOid;
+		CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
+
+		/* Record dependency on tablespace. */
+		changeDependencyOnTablespace(RelationRelationId,
+									 reloid, rd_rel->reltablespace);
+
+		changed = true;
+	}
+
+	InvokeObjectPostAlterHook(RelationRelationId, reloid, 0);
+
+	heap_freetuple(tuple);
+	table_close(pg_class, RowExclusiveLock);
+
+	return changed;
+}
+
+/*
  * Special handling of ALTER TABLE SET TABLESPACE for relations with no
  * storage that have an interest in preserving tablespace.
  *
@@ -13301,10 +13354,6 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, LOCKMODE lockmode)
 static void
 ATExecSetTableSpaceNoStorage(Relation rel, Oid newTableSpace)
 {
-	HeapTuple	tuple;
-	Oid			oldTableSpace;
-	Relation	pg_class;
-	Form_pg_class rd_rel;
 	Oid			reloid = RelationGetRelid(rel);
 
 	/*
@@ -13319,41 +13368,9 @@ ATExecSetTableSpaceNoStorage(Relation rel, Oid newTableSpace)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("only shared relations can be placed in pg_global tablespace")));
 
-	/*
-	 * No work if no change in tablespace.
-	 */
-	oldTableSpace = rel->rd_rel->reltablespace;
-	if (newTableSpace == oldTableSpace ||
-		(newTableSpace == MyDatabaseTableSpace && oldTableSpace == 0))
-	{
-		InvokeObjectPostAlterHook(RelationRelationId, reloid, 0);
-		return;
-	}
-
-	/* Get a modifiable copy of the relation's pg_class row */
-	pg_class = table_open(RelationRelationId, RowExclusiveLock);
-
-	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(reloid));
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "cache lookup failed for relation %u", reloid);
-	rd_rel = (Form_pg_class) GETSTRUCT(tuple);
-
-	/* update the pg_class row */
-	rd_rel->reltablespace = (newTableSpace == MyDatabaseTableSpace) ? InvalidOid : newTableSpace;
-	CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
-
-	/* Record dependency on tablespace */
-	changeDependencyOnTablespace(RelationRelationId,
-								 reloid, rd_rel->reltablespace);
-
-	InvokeObjectPostAlterHook(RelationRelationId, reloid, 0);
-
-	heap_freetuple(tuple);
-
-	table_close(pg_class, RowExclusiveLock);
-
-	/* Make sure the reltablespace change is visible */
-	CommandCounterIncrement();
+	if (SetRelationTableSpace(reloid, newTableSpace))
+		/* Make sure the reltablespace change is visible */
+		CommandCounterIncrement();
 }
 
 /*
