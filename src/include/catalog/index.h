@@ -33,7 +33,7 @@ typedef enum
 typedef struct ReindexParams
 {
 	bits32		options;		/* bitmask of REINDEXOPT_* */
-	Oid  tablespaceOid;					/* tablespace to rebuild index */
+	Oid  tablespaceOid;			/* tablespace to rebuild index */
 } ReindexParams;
 
 /* flag bits for ReindexParams->flags */
