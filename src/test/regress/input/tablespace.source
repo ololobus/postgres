@@ -51,25 +51,21 @@ REINDEX (TABLESPACE pg_default) DATABASE regression; -- ok with warning
 SELECT relname FROM pg_class
 WHERE reltablespace=(SELECT oid FROM pg_tablespace WHERE spcname='regress_tblspace');
 
--- partitioned indexes are not directly reindexed
+-- partitioned indexes are not directly reindexed, but we still have to set proper
+-- tablespace in pg_class for them
 REINDEX (TABLESPACE regress_tblspace) TABLE regress_tblspace_test_pt; -- ok
 REINDEX (TABLESPACE regress_tblspace) INDEX regress_tblspace_test_pt_idx_1; -- ok
 REINDEX (TABLESPACE regress_tblspace) INDEX regress_tblspace_test_pt_idx_2; -- ok
 SELECT relname FROM pg_class
 WHERE reltablespace=(SELECT oid FROM pg_tablespace WHERE spcname='regress_tblspace');
 
--- indexes for new partitions should be created in the old tablespace
+-- indexes for new partitions should be created in the new tablespace
 CREATE TABLE regress_tblspace_test_pt_2
   PARTITION OF regress_tblspace_test_pt
   FOR VALUES WITH (modulus 2, remainder 1);
 CREATE TABLE regress_tblspace_test_pt_1_1
   PARTITION OF regress_tblspace_test_pt_1
   FOR VALUES WITH (modulus 2, remainder 0);
-SELECT relname FROM pg_class
-WHERE reltablespace=(SELECT oid FROM pg_tablespace WHERE spcname='regress_tblspace');
-
--- reindex partitioned table
-REINDEX (TABLESPACE regress_tblspace) TABLE regress_tblspace_test_pt; -- ok
 SELECT relname FROM pg_class
 WHERE reltablespace=(SELECT oid FROM pg_tablespace WHERE spcname='regress_tblspace');
 

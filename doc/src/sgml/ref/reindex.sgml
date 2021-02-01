@@ -321,9 +321,7 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { IN
    relation, and <literal>TABLESPACE</literal> was specified, then it may have
    moved indexes on some partitions to the new tablespace. Re-running the command
    will reindex all partitions and move previously-unprocessed indexes to the new
-   tablespace. Note that partitioned indexes are not moved to the
-   <replaceable class="parameter">new_tablespace</replaceable>, only leaf
-   partitions holding data get reindexed and moved there.
+   tablespace.
   </para>
 
   <refsect2 id="sql-reindex-concurrently" xreflabel="Rebuilding Indexes Concurrently">

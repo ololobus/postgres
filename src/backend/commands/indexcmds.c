@@ -3019,6 +3019,42 @@ ReindexPartitions(Oid relid, ReindexParams *params, bool isTopLevel)
 		MemoryContext old_context;
 
 		/*
+		 * Foreign tables and partitioned relations are not themselves
+		 * reindexed - leaf partitions are processed directly.  But any
+		 * tablespace change is recorded in the catalog for partitioned
+		 * relations.
+		 */
+		if (partkind == RELKIND_PARTITIONED_INDEX)
+		{
+			Relation iRel = index_open(partoid, AccessExclusiveLock);
+
+			if (CheckRelationTableSpaceMove(iRel, params->tablespaceOid))
+				SetRelationTableSpace(iRel,
+									  params->tablespaceOid,
+									  InvalidOid);
+			index_close(iRel, NoLock);
+		}
+		else if (partkind == RELKIND_PARTITIONED_TABLE)
+		{
+			Relation rel = table_open(partoid, ShareLock);
+			List	*indexIds = RelationGetIndexList(rel);
+			ListCell *lc;
+
+			table_close(rel, NoLock);
+			foreach (lc, indexIds)
+			{
+				Oid indexid = lfirst_oid(lc);
+				Relation iRel = index_open(indexid, AccessExclusiveLock);
+
+				if (CheckRelationTableSpaceMove(iRel, params->tablespaceOid))
+					SetRelationTableSpace(iRel,
+										  params->tablespaceOid,
+										  InvalidOid);
+				index_close(iRel, NoLock);
+			}
+		}
+
+		/*
 		 * This discards partitioned tables, partitioned indexes and foreign
 		 * tables.
 		 */
